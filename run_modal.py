@@ -64,7 +64,7 @@ image = (
         "datasets",
         "requests",
     )
-    .add_local_dir(".", remote_path="/workspace", ignore=[".git", "mini-sglang"])
+    .add_local_dir(".", remote_path="/workspace", ignore=[".git", "mini-sglang"], copy=True)
     # Apply our scheduler patches on top of the cloned repo
     .run_commands("bash /workspace/apply_patches.sh /opt/mini-sglang")
 )
@@ -244,7 +244,15 @@ def main(
     rate: float = 3.0,
     q: float = 4000.0,
     all: bool = False,
+    smoke_test: bool = False,
 ):
+    # --smoke-test: start server with dummy weights and send one request
+    if smoke_test:
+        print(f"Running smoke test (policy={policy}, dummy weights) ...")
+        result = smoke_test_server.remote(policy=policy)
+        print(f"Smoke test result: {result}")
+        return
+
     # --all: run every named experiment back-to-back
     if all:
         for exp in ["starvation", "workload_shift", "pareto", "ablation"]:
