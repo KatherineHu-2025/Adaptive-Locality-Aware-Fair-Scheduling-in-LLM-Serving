@@ -99,23 +99,31 @@ def smoke_test_server(policy: str = "lpm") -> str:
 
     env = {**os.environ, "MINISGL_POLICY": policy}
     server = subprocess.Popen(
-        ["python", "-m", "minisgl", "--model", MODEL_NAME, "--use-dummy-weight",
-         "--server-port", "19190"],
+        ["python", "-m", "minisgl", "--model-path", MODEL_NAME, "--dummy-weight",
+         "--port", "19190"],
         env=env,
         cwd="/opt/mini-sglang",
     )
-    time.sleep(10)  # wait for server to start
-    try:
-        resp = req_lib.post(
-            "http://127.0.0.1:19190/generate",
-            json={"text": "Hello world", "sampling_params": {"max_tokens": 8}},
-            timeout=30,
-        )
-        return f"OK (policy={policy}): {resp.status_code} — {resp.text[:200]}"
-    except Exception as e:
-        return f"ERROR: {e}"
-    finally:
-        server.terminate()
+    # Poll until the server accepts connections (up to 120s)
+    deadline = time.time() + 120
+    last_err = None
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            resp = req_lib.post(
+                "http://127.0.0.1:19190/generate",
+                json={"prompt": "Hello world", "max_tokens": 8, "client_id": "smoke_test"},
+                timeout=10,
+            )
+            server.terminate()
+            return f"OK (policy={policy}): {resp.status_code} — {resp.text[:200]}"
+        except req_lib.exceptions.ConnectionError as e:
+            last_err = e  # server not up yet, keep waiting
+        except Exception as e:
+            server.terminate()
+            return f"ERROR (unexpected): {e}"
+    server.terminate()
+    return f"ERROR: server did not become ready within 120s. Last error: {last_err}"
 
 
 @app.function(image=image, gpu="A100", timeout=7200, secrets=secrets)

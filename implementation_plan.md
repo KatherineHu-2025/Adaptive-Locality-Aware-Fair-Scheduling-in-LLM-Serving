@@ -15,7 +15,8 @@
 5. [Week 4: Analysis and Writeup](#5-week-4-analysis-and-writeup)
 6. [Key Data Structures and Interfaces](#6-key-data-structures-and-interfaces)
 7. [Evaluation Protocol](#7-evaluation-protocol)
-8. [Risk Register](#8-risk-register)
+8. [How to Run Tests](#8-how-to-run-tests)
+9. [Risk Register](#9-risk-register)
 
 ---
 
@@ -160,35 +161,64 @@ The two-client starvation scenario (dominant vs. cold client) is verified by uni
 
 ---
 
-### ❌ Step 1.5 — Parse datasets
+### ✅ Step 1.5 — Parse datasets
 
-Not yet implemented. Need parsers for:
-- **Chatbot Arena** — multi-turn conversations; use `conversation_id` as `client_id`
-- **LooGLE** — long-context QA; useful for triggering starvation (expensive cold-start prefills)
+Three loaders implemented in [workload/dataset.py](workload/dataset.py), all outputting a unified `RequestSpec`:
 
-Both should output a unified `RequestSpec`:
 ```python
 @dataclass
 class RequestSpec:
     client_id: str
     prompt: str
     expected_output_len: int
-    arrival_time: float   # seconds from trace start, for replay
+    arrival_time: float   # seconds from trace start, for replay (0.0 = unset)
 ```
 
+| Loader | Dataset | `client_id` | Notes |
+|---|---|---|---|
+| `load_chatbot_arena()` | `lmsys/chatbot_arena_conversations` (gated) | `question_id` | Multi-turn: each turn's prompt prepends all prior turns (Step 1.7 folded in) |
+| `load_loogle()` | `bigai-nlco/LooGLE longdep_qa` (public) | `doc_id` | Long contexts (60k+ chars); cold-start starvation trigger; `one_per_doc=True` for pure cold starts |
+| `load_synthetic()` | Generated (no download) | `client_dominant` / `client_cold` | Controlled starvation experiment; dominant client has long shared system prompt |
+
+**Relevant file:** [workload/dataset.py](workload/dataset.py) · [tests/test_dataset.py](tests/test_dataset.py)
+
 ---
 
-### ❌ Step 1.6 — Build the workload client
+### ✅ Step 1.6 — Build the workload client
 
-Not yet implemented. Needs to replay traces using a **Gamma process** for inter-arrival times (k<1 = bursty, k=1 = Poisson/random, k>1 = regular).
+Implemented in [workload/client.py](workload/client.py).
 
-Also needs a synthetic starvation workload: one dominant client sending N req/sec with a long shared system prompt, plus one cold client sending 1 req every few seconds.
+`gamma_interarrivals(n, rate, k, seed=42)` generates inter-arrival times from Gamma(shape=k, scale=1/(rate·k)). Mean is always 1/rate; k controls shape:
+
+| k | Traffic pattern |
+|---|---|
+| < 1 | Bursty |
+| = 1 | Poisson / memoryless |
+| > 1 | Regular / smooth |
+
+`replay(specs, server_url, rate, k, policy, output_path, ...)` fires requests at Gamma-timed intervals, parses the SSE stream, records TTFT and TPOT per request, and writes a JSONL log line per completed request. `print_summary()` prints throughput, P50/P99 TTFT, per-client breakdown, and Jain Index.
+
+CLI usage (against a running server):
+```bash
+python -m workload.client --dataset synthetic --rate 3.0 --k 1.0 --policy adaptive_dlpm
+python -m workload.client --dataset loogle    --rate 2.0 --k 0.5 --policy lpm
+```
+
+**Relevant file:** [workload/client.py](workload/client.py) · [tests/test_client.py](tests/test_client.py)
 
 ---
 
-### ❌ Step 1.7 — Multi-turn conversation simulation
+### ✅ Step 1.7 — Multi-turn conversation simulation
 
-Not yet implemented. For multi-turn, each new turn must concatenate all prior turns into the prompt so the prefix cache is maximally reused.
+Implemented inside `load_chatbot_arena()` in [workload/dataset.py](workload/dataset.py). Each turn's prompt is the full conversation history up to that point:
+
+```
+Turn 1:  "Human: <u1>"
+Turn 2:  "Human: <u1>\nAssistant: <a1>\nHuman: <u2>"
+Turn 3:  "Human: <u1>\nAssistant: <a1>\nHuman: <u2>\nAssistant: <a2>\nHuman: <u3>"
+```
+
+This ensures every turn after the first reuses the prefix cached from the previous turn, maximizing cache hit rate for the dominant-client scenario.
 
 ---
 
@@ -224,9 +254,9 @@ Not yet implemented. For multi-turn, each new turn must concatenate all prior tu
 
 - ✅ All three primary policy flags work (`lpm`, `dlpm`, `adaptive_dlpm`); `fcfs` works as secondary
 - ✅ Static DLPM passes the two-client starvation test (unit tests)
-- ❌ Client script fires Gamma-process traffic at the server
+- ✅ Client script fires Gamma-process traffic at the server (`workload/client.py`)
 - ✅ Telemetry records TTFT, Jain Index, cache hit rate per request (in memory)
-- ❌ A single run produces a CSV/JSON log that can be analyzed offline
+- ⚠️ Client writes per-request JSONL (client-side fields only); server-side fields (`cached_len`, `Q_at_scheduling`) require Step 2.4 file logging
 
 ---
 
@@ -431,7 +461,97 @@ Structure (MLSys 2025 format):
 
 ---
 
-## 8. Risk Register
+## 8. How to Run Tests
+
+> **Platform note:** `sgl_kernel` is CUDA-only and has no macOS build. Unit tests run locally on any machine; everything else requires a GPU and must be run via Modal.
+
+---
+
+### Unit Tests (local, no GPU)
+
+All scheduling policy logic, AIMD controller, and telemetry math are covered by unit tests that need no GPU or mini-sglang install.
+
+```bash
+# From the project root
+pip install pytest
+pytest tests/test_scheduler_logic.py -v
+```
+
+Expected: **25 passed** in < 1 second.
+
+---
+
+### End-to-End Smoke Test (Modal — GPU required)
+
+`run_modal.py` handles patching, installing, and starting the server on an A100 in the cloud.
+
+**One-time setup:**
+
+```bash
+pip install modal
+modal setup    # opens browser for auth
+```
+
+**Run the smoke test** (starts server with dummy weights, sends one request, prints result):
+
+```bash
+# From the project root
+modal run run_modal.py --smoke-test
+```
+
+Expected output (dummy weights produce garbage tokens — that's normal):
+```
+Smoke test result: OK (policy=adaptive_dlpm): 200 — data: ...
+```
+
+Key log lines to verify our code is active:
+```
+Adaptive DLPM: AIMD controller initialized (Q_init=4000)
+Scheduler policy: adaptive_dlpm (static_Q=4000)
+POST /generate HTTP/1.1" 200 OK
+```
+
+**Test a specific policy:**
+
+```bash
+modal run run_modal.py --smoke-test --policy lpm
+modal run run_modal.py --smoke-test --policy dlpm
+```
+
+**What the smoke test verifies:**
+- HTTP server accepts `POST /generate` with a `client_id` field
+- `client_id` flows through the full pipeline: `TokenizeMsg` → `UserMsg` → `PendingReq`
+- Scheduler initializes with the correct policy and AIMD controller
+- Prefill runs on the GPU, produces tokens, and the response streams back as HTTP 200
+
+This is a **plumbing test only** — it confirms nothing crashes and all modified files integrate correctly. It does NOT verify scheduling correctness, AIMD Q adjustment, or starvation reduction; those require the workload client (Steps 1.5–1.6) sending sustained multi-client traffic.
+
+**Why the output tokens are garbage:** `--dummy-weight` initializes model weights to random values instead of loading the real checkpoint. The GPU computation is real, but the outputs are statistically meaningless. This is expected and intentional.
+
+**Note:** A `RuntimeError: CacheManager integrity check failed` traceback appears on shutdown — this is a pre-existing mini-sglang bug triggered during process termination and does not affect request correctness.
+
+---
+
+### AIMD Environment Variable Reference
+
+Policy and AIMD knobs are set via environment variables in `run_modal.py` (or passed directly when running on a GPU machine):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `MINISGL_POLICY` | `lpm` | Scheduling policy: `fcfs`, `lpm`, `dlpm`, `adaptive_dlpm` |
+| `MINISGL_STATIC_Q` | `4000` | Token quota Q for static DLPM |
+| `AIMD_Q_INIT` | `4000` | Starting Q for adaptive DLPM |
+| `AIMD_Q_MIN` | `500` | Q lower bound |
+| `AIMD_Q_MAX` | `64000` | Q upper bound |
+| `AIMD_JAIN_THRESHOLD` | `0.75` | Jain index below this → tighten Q |
+| `AIMD_TTFT_SLO_MS` | `2000` | P99 TTFT (ms) above this → tighten Q |
+| `AIMD_ADDITIVE_STEP` | `500` | Tokens added to Q per healthy step |
+| `AIMD_MULT_FACTOR` | `0.5` | Q multiplier on violation |
+| `AIMD_CONTROL_INTERVAL` | `50` | Scheduling steps between controller updates |
+
+---
+
+## 9. Risk Register
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
