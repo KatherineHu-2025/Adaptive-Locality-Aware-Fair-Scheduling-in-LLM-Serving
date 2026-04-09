@@ -104,7 +104,9 @@ def smoke_test_server(policy: str = "lpm") -> str:
         env=env,
         cwd="/opt/mini-sglang",
     )
-    # Poll until the server accepts connections (up to 120s)
+    # Poll until the server accepts connections (up to 120s).
+    # Use stream=True so we only wait for the first SSE line, not the full
+    # response body — avoids read timeouts on slow streaming responses.
     deadline = time.time() + 120
     last_err = None
     while time.time() < deadline:
@@ -113,11 +115,16 @@ def smoke_test_server(policy: str = "lpm") -> str:
             resp = req_lib.post(
                 "http://127.0.0.1:19190/generate",
                 json={"prompt": "Hello world", "max_tokens": 8, "client_id": "smoke_test"},
-                timeout=10,
+                timeout=30,
+                stream=True,
             )
+            # Read just the first line to confirm the server is responding
+            first_line = next(resp.iter_lines(decode_unicode=True), "")
+            resp.close()
             server.terminate()
-            return f"OK (policy={policy}): {resp.status_code} — {resp.text[:200]}"
-        except req_lib.exceptions.ConnectionError as e:
+            return f"OK (policy={policy}): {resp.status_code} — {first_line[:200]}"
+        except (req_lib.exceptions.ConnectionError,
+                req_lib.exceptions.Timeout) as e:
             last_err = e  # server not up yet, keep waiting
         except Exception as e:
             server.terminate()
