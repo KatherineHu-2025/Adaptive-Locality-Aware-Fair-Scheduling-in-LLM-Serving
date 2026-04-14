@@ -1,5 +1,5 @@
 """
-Adaptive DLPM Scheduler — Modal Cloud Runner
+Adaptive DLPM Scheduler — Modal Batch Runner
 
 Setup (one-time):
     pip install modal
@@ -8,6 +8,12 @@ Setup (one-time):
 Usage:
     # Run all scheduler unit tests
     modal run run_modal.py
+
+    # Fast smoke test: dummy weights (startup/readiness validation)
+    modal run run_modal.py --smoke-test --policy adaptive_dlpm
+
+    # Readable smoke test: real weights (text quality sanity check; slower)
+    modal run run_modal.py --smoke-test-readable --policy adaptive_dlpm
 
     # Run a specific experiment
     modal run run_modal.py --experiment starvation
@@ -33,7 +39,7 @@ Supported experiments:
 import sys
 import modal
 
-app = modal.App("adaptive-dlpm-scheduler")
+app = modal.App("adaptive-dlpm-jobs")
 
 # ---------------------------------------------------------------------------
 # Image
@@ -94,35 +100,60 @@ def run_tests(test_pattern: str = "tests/") -> int:
 
 @app.function(image=image, gpu="A100", timeout=600, secrets=secrets)
 def smoke_test_server(policy: str = "lpm") -> str:
-    """Start mini-sglang with --use-dummy-weight and send one request to confirm it works."""
+    """Fast smoke test with dummy weights for readiness/streaming checks."""
     import subprocess, time, requests as req_lib, os
 
     env = {**os.environ, "MINISGL_POLICY": policy}
     server = subprocess.Popen(
         ["python", "-m", "minisgl", "--model-path", MODEL_NAME, "--dummy-weight",
+         "--cuda-graph-max-bs", "1",
          "--port", "19190"],
         env=env,
         cwd="/opt/mini-sglang",
     )
-    # Poll until the server accepts connections (up to 120s).
-    # Use stream=True so we only wait for the first SSE line, not the full
-    # response body — avoids read timeouts on slow streaming responses.
-    deadline = time.time() + 120
+    # Poll until the HTTP server is ready (up to 240s), then run one generate request.
+    deadline = time.time() + 240
     last_err = None
     while time.time() < deadline:
         time.sleep(3)
         try:
+            health = req_lib.get("http://127.0.0.1:19190/v1", timeout=5)
+            if not health.ok:
+                last_err = f"health status={health.status_code}"
+                continue
+
             resp = req_lib.post(
                 "http://127.0.0.1:19190/generate",
-                json={"prompt": "Hello world", "max_tokens": 8, "client_id": "smoke_test"},
-                timeout=30,
+                json={
+                    "prompt": "In one short sentence, explain what adaptive DLPM does.",
+                    "max_tokens": 48,
+                    "client_id": "smoke_test",
+                },
+                timeout=(10, 90),
                 stream=True,
             )
-            # Read just the first line to confirm the server is responding
-            first_line = next(resp.iter_lines(decode_unicode=True), "")
+
+            if resp.status_code != 200:
+                body = resp.text[:200]
+                resp.close()
+                last_err = f"generate status={resp.status_code}: {body}"
+                continue
+
+            chunks = []
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                token = line[len("data:"):].strip()
+                if token == "[DONE]":
+                    break
+                chunks.append(token)
+
             resp.close()
             server.terminate()
-            return f"OK (policy={policy}): {resp.status_code} — {first_line[:200]}"
+            preview = "".join(chunks).strip()
+            if not preview:
+                return f"ERROR (policy={policy}): server responded but output was empty"
+            return f"OK (policy={policy}): {preview[:300]}"
         except (req_lib.exceptions.ConnectionError,
                 req_lib.exceptions.Timeout) as e:
             last_err = e  # server not up yet, keep waiting
@@ -130,7 +161,74 @@ def smoke_test_server(policy: str = "lpm") -> str:
             server.terminate()
             return f"ERROR (unexpected): {e}"
     server.terminate()
-    return f"ERROR: server did not become ready within 120s. Last error: {last_err}"
+    return f"ERROR: server did not become ready within 240s. Last error: {last_err}"
+
+
+@app.function(image=image, gpu="A100", timeout=1200, secrets=secrets)
+def smoke_test_server_readable(policy: str = "adaptive_dlpm") -> str:
+    """Smoke test with real weights to verify readable output (slower startup)."""
+    import subprocess, time, requests as req_lib, os
+
+    env = {**os.environ, "MINISGL_POLICY": policy}
+    server = subprocess.Popen(
+        ["python", "-m", "minisgl", "--model-path", MODEL_NAME,
+         "--cuda-graph-max-bs", "1",
+         "--port", "19190"],
+        env=env,
+        cwd="/opt/mini-sglang",
+    )
+
+    deadline = time.time() + 420
+    last_err = None
+    while time.time() < deadline:
+        time.sleep(3)
+        try:
+            health = req_lib.get("http://127.0.0.1:19190/v1", timeout=5)
+            if not health.ok:
+                last_err = f"health status={health.status_code}"
+                continue
+
+            resp = req_lib.post(
+                "http://127.0.0.1:19190/generate",
+                json={
+                    "prompt": "Reply in one clear English sentence: what does adaptive DLPM do in LLM serving?",
+                    "max_tokens": 64,
+                    "client_id": "smoke_test_readable",
+                },
+                timeout=(10, 120),
+                stream=True,
+            )
+
+            if resp.status_code != 200:
+                body = resp.text[:200]
+                resp.close()
+                last_err = f"generate status={resp.status_code}: {body}"
+                continue
+
+            chunks = []
+            for line in resp.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                token = line[len("data:"):].strip()
+                if token == "[DONE]":
+                    break
+                chunks.append(token)
+
+            resp.close()
+            server.terminate()
+            preview = "".join(chunks).strip()
+            if not preview:
+                return f"ERROR (policy={policy}): server responded but output was empty"
+            return f"OK-READABLE (policy={policy}): {preview[:300]}"
+        except (req_lib.exceptions.ConnectionError,
+                req_lib.exceptions.Timeout) as e:
+            last_err = e
+        except Exception as e:
+            server.terminate()
+            return f"ERROR (unexpected): {e}"
+
+    server.terminate()
+    return f"ERROR: readable smoke test server did not become ready within 420s. Last error: {last_err}"
 
 
 @app.function(image=image, gpu="A100", timeout=7200, secrets=secrets)
@@ -260,7 +358,15 @@ def main(
     q: float = 4000.0,
     all: bool = False,
     smoke_test: bool = False,
+    smoke_test_readable: bool = False,
 ):
+    # --smoke-test-readable: start server with real weights and verify text quality
+    if smoke_test_readable:
+        print(f"Running readable smoke test (policy={policy}, real weights) ...")
+        result = smoke_test_server_readable.remote(policy=policy)
+        print(f"Readable smoke test result: {result}")
+        return
+
     # --smoke-test: start server with dummy weights and send one request
     if smoke_test:
         print(f"Running smoke test (policy={policy}, dummy weights) ...")

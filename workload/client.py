@@ -15,6 +15,11 @@ Inter-arrival time ~ Gamma(shape=k, scale=1 / (rate * k))
 
 The mean inter-arrival is always 1/rate regardless of k.
 
+Arrival mode
+------------
+    global      → one Gamma process for all requests in list order
+    per-client  → one Gamma process per client_id, merged by timestamp
+
 Usage (Python API)
 ------------------
     import asyncio
@@ -25,6 +30,7 @@ Usage (Python API)
     results = asyncio.run(replay(
         specs=specs,
         server_url="http://127.0.0.1:19190",
+        arrival_mode="global",
         rate=3.0,
         k=1.0,
         output_path="results/run_001.jsonl",
@@ -33,12 +39,26 @@ Usage (Python API)
 
 Usage (CLI)
 -----------
+    # Local minisgl server
     python -m workload.client \\
         --server http://127.0.0.1:19190 \\
         --dataset synthetic \\
+        --arrival-mode global \\
         --rate 3.0 --k 1.0 \\
         --policy adaptive_dlpm \\
+        --timeout 120 --max-concurrency 64 \\
         --output results/run_001.jsonl
+
+    # Modal-hosted endpoint (single-GPU friendly settings)
+    python -m workload.client \\
+        --server https://<your-modal-url> \\
+        --dataset synthetic \\
+        --arrival-mode per-client \\
+        --rate 1.0 --k 1.0 \\
+        --policy adaptive_dlpm \\
+        --timeout 600 --max-concurrency 2 \\
+        --dominant-reqs 20 --cold-reqs 5 \\
+        --output results/run_modal_test.jsonl
 """
 
 from __future__ import annotations
@@ -108,6 +128,54 @@ def gamma_interarrivals(n: int, rate: float, k: float, seed: int = 42) -> np.nda
     rng = np.random.default_rng(seed)
     scale = 1.0 / (rate * k)
     return rng.gamma(shape=k, scale=scale, size=n)
+
+
+def build_arrival_plan(
+    specs: List[RequestSpec],
+    rate: float,
+    k: float,
+    seed: int,
+    arrival_mode: str,
+) -> List[tuple[float, RequestSpec]]:
+    """
+    Build absolute arrival times for each request.
+
+    arrival_mode="global":
+        One Gamma process over all requests in list order.
+
+    arrival_mode="per-client":
+        One Gamma process per client_id, then merge by timestamp.
+        The total target rate is split evenly across active clients.
+    """
+    if arrival_mode == "global":
+        interarrivals = gamma_interarrivals(len(specs), rate=rate, k=k, seed=seed)
+        scheduled = np.cumsum(interarrivals)
+        return list(zip(scheduled.tolist(), specs))
+
+    if arrival_mode != "per-client":
+        raise ValueError(f"Unknown arrival mode: {arrival_mode}")
+
+    by_client: dict[str, List[RequestSpec]] = {}
+    for spec in specs:
+        by_client.setdefault(spec.client_id, []).append(spec)
+
+    n_clients = max(1, len(by_client))
+    per_client_rate = rate / n_clients
+
+    merged: List[tuple[float, RequestSpec]] = []
+    for idx, (_, client_specs) in enumerate(by_client.items()):
+        client_seed = seed + idx * 10007
+        interarrivals = gamma_interarrivals(
+            len(client_specs),
+            rate=per_client_rate,
+            k=k,
+            seed=client_seed,
+        )
+        scheduled = np.cumsum(interarrivals)
+        merged.extend(zip(scheduled.tolist(), client_specs))
+
+    merged.sort(key=lambda x: x[0])
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +277,7 @@ async def replay(
     seed: int = 42,
     timeout: float = 120.0,
     max_concurrency: int = 64,
+    arrival_mode: str = "global",
 ) -> List[RequestResult]:
     """
     Replay a list of RequestSpec objects against the server using a
@@ -227,6 +296,7 @@ async def replay(
     seed            : random seed for Gamma inter-arrivals (default 42)
     timeout         : per-request HTTP timeout in seconds
     max_concurrency : maximum simultaneous in-flight requests
+    arrival_mode    : arrival process mode: "global" or "per-client"
 
     Returns
     -------
@@ -235,7 +305,13 @@ async def replay(
     if not specs:
         return []
 
-    interarrivals = gamma_interarrivals(len(specs), rate=rate, k=k, seed=seed)
+    arrival_plan = build_arrival_plan(
+        specs=specs,
+        rate=rate,
+        k=k,
+        seed=seed,
+        arrival_mode=arrival_mode,
+    )
     semaphore = asyncio.Semaphore(max_concurrency)
     results: List[RequestResult] = []
 
@@ -262,9 +338,7 @@ async def replay(
     async with aiohttp.ClientSession(connector=connector) as session:
         t0 = time.perf_counter()
         tasks = []
-        scheduled_at = 0.0
-        for i, spec in enumerate(specs):
-            scheduled_at += interarrivals[i]
+        for scheduled_at, spec in arrival_plan:
             now = time.perf_counter() - t0
             delay = max(0.0, scheduled_at - now)
             if delay > 0:
@@ -343,6 +417,8 @@ def _parse_args():
     p.add_argument("--server",  default="http://127.0.0.1:19190")
     p.add_argument("--dataset", choices=["synthetic", "loogle", "chatbot_arena"],
                    default="synthetic")
+    p.add_argument("--arrival-mode", choices=["global", "per-client"], default="global",
+                   help="Arrival process mode: one global Gamma process or one per client")
     p.add_argument("--rate",    type=float, default=2.0,
                    help="Target arrival rate (req/sec)")
     p.add_argument("--k",       type=float, default=1.0,
@@ -355,6 +431,10 @@ def _parse_args():
     p.add_argument("--seed",    type=int, default=42)
     p.add_argument("--dominant-reqs", type=int, default=80)
     p.add_argument("--cold-reqs",     type=int, default=20)
+    p.add_argument("--timeout", type=float, default=120.0,
+                   help="Per-request HTTP timeout in seconds")
+    p.add_argument("--max-concurrency", type=int, default=64,
+                   help="Maximum simultaneous in-flight requests")
     return p.parse_args()
 
 
@@ -376,7 +456,10 @@ async def _main():
 
     output = args.output or f"results/{args.dataset}_{args.policy}.jsonl"
 
-    print(f"Replaying {len(specs)} requests  rate={args.rate} req/s  k={args.k}")
+    print(
+        f"Replaying {len(specs)} requests  arrival_mode={args.arrival_mode}  "
+        f"rate={args.rate} req/s  k={args.k}"
+    )
     print(f"Server: {args.server}  Policy label: {args.policy}")
     print(f"Output: {output}\n")
 
@@ -388,6 +471,9 @@ async def _main():
         policy=args.policy,
         output_path=output,
         seed=args.seed,
+        timeout=args.timeout,
+        max_concurrency=args.max_concurrency,
+        arrival_mode=args.arrival_mode,
     )
     print_summary(results)
 
