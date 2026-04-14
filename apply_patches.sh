@@ -43,7 +43,7 @@ echo "  [MOD]  $PKG/scheduler/prefill.py      (+ policy dispatch + deficit updat
 echo "  [MOD]  $PKG/scheduler/scheduler.py    (+ telemetry recording + AIMD wiring)"
 echo "  [MOD]  $PKG/message/backend.py        (+ client_id on UserMsg)"
 echo "  [MOD]  $PKG/message/tokenizer.py      (+ client_id on TokenizeMsg)"
-echo "  [MOD]  $PKG/tokenizer/server.py       (+ pass client_id → UserMsg)"
+echo "  [MOD]  $PKG/tokenizer/server.py       (+ pass client_id -> UserMsg)"
 echo "  [MOD]  $PKG/server/api_server.py      (+ client_id on request models)"
 echo ""
 echo "Quick smoke test:"
