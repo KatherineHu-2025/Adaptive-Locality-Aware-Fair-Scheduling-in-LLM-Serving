@@ -288,6 +288,22 @@ python run_aimd_ab_test_v2.py --plot-only --server https://<your-modal-url>
 
 ---
 
+## Latest FCFS vs LPM Baseline (2026-04-14)
+
+Baseline FCFS vs LPM analysis from the grid benchmark is documented in:
+- [fcfs_lpm_summary.md](fcfs_lpm_summary.md)
+
+Auto-generated benchmark visualizations and summary:
+- [docs/plots/modal_grid_20260414_200819_throughput_vs_rate.png](docs/plots/modal_grid_20260414_200819_throughput_vs_rate.png)
+- [docs/plots/modal_grid_20260414_200819_ttft_p99_vs_rate.png](docs/plots/modal_grid_20260414_200819_ttft_p99_vs_rate.png)
+- [docs/plots/modal_grid_20260414_200819_pareto.png](docs/plots/modal_grid_20260414_200819_pareto.png)
+- [docs/plots/modal_grid_20260414_200819_summary.md](docs/plots/modal_grid_20260414_200819_summary.md)
+
+Snapshot takeaway:
+- On this workload grid, FCFS outperformed LPM on latency and was competitive to better on throughput, especially at higher load.
+
+---
+
 ## What's Still To Do
 
 - [ ] **Dataset parsers** — download and parse Chatbot Arena / LooGLE traces

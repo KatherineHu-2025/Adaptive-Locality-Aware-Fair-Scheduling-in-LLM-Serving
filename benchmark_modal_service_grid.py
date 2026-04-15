@@ -7,6 +7,10 @@ What this script does:
 3) Runs workload.client across a grid of rates, k values, policies, and request counts.
 4) Summarizes each run and writes CSV + JSON outputs.
 
+Dataset behavior:
+- synthetic: request_count is split into dominant/cold by --cold-fraction.
+- loogle/chatbot_arena: request_count is passed as --max-reqs to workload.client.
+
 Example:
     python benchmark_modal_service_grid.py \
       --policies adaptive_dlpm,lpm,dlpm \
@@ -75,6 +79,8 @@ def run_cmd(cmd: list[str], env: dict[str, str] | None = None, capture: bool = F
         cmd,
         env=cmd_env,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
         capture_output=capture,
     )
@@ -162,7 +168,16 @@ def percentile(sorted_values: list[float], p: float) -> float:
     return sorted_values[idx]
 
 
-def summarize_jsonl(path: Path, policy: str, rate: float, k: float, request_count: int, dominant: int, cold: int) -> dict[str, Any]:
+def summarize_jsonl(
+    path: Path,
+    policy: str,
+    dataset: str,
+    rate: float,
+    k: float,
+    request_count: int,
+    dominant: int,
+    cold: int,
+) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -189,6 +204,7 @@ def summarize_jsonl(path: Path, policy: str, rate: float, k: float, request_coun
 
     return {
         "policy": policy,
+        "dataset": dataset,
         "rate": rate,
         "k": k,
         "request_count": request_count,
@@ -204,8 +220,51 @@ def summarize_jsonl(path: Path, policy: str, rate: float, k: float, request_coun
         "ttft_p99_ms": percentile(ttfts, 0.99),
         "ttft_mean_ms": statistics.fmean(ttfts) if ttfts else float("nan"),
         "jain_index": jain,
+        "run_error": "",
         "output_file": str(path),
     }
+
+
+def make_failed_row(
+    policy: str,
+    dataset: str,
+    rate: float,
+    k: float,
+    request_count: int,
+    dominant: int,
+    cold: int,
+    output_file: Path,
+    run_error: str,
+) -> dict[str, Any]:
+    """Return a consistent summary row for workload runs that failed before JSONL output was written."""
+    return {
+        "policy": policy,
+        "dataset": dataset,
+        "rate": rate,
+        "k": k,
+        "request_count": request_count,
+        "dominant_reqs": dominant,
+        "cold_reqs": cold,
+        "total_requests": 0,
+        "success_count": 0,
+        "failed_count": 0,
+        "success_rate": 0.0,
+        "throughput_tok_per_sec": float("nan"),
+        "ttft_p50_ms": float("nan"),
+        "ttft_p95_ms": float("nan"),
+        "ttft_p99_ms": float("nan"),
+        "ttft_mean_ms": float("nan"),
+        "jain_index": float("nan"),
+        "run_error": run_error,
+        "output_file": str(output_file),
+    }
+
+
+def format_run_error(res: subprocess.CompletedProcess[str], tail_chars: int = 4000) -> str:
+    combined = ((res.stdout or "") + "\n" + (res.stderr or "")).strip()
+    if not combined:
+        return "workload.client failed with no stdout/stderr output"
+    return safe_for_console(combined[-tail_chars:])
 
 
 def stop_service(service_name: str) -> None:
@@ -217,8 +276,10 @@ def stop_service(service_name: str) -> None:
 def run_client_once(
     base_url: str,
     policy: str,
+    dataset: str,
     rate: float,
     k: float,
+    request_count: int,
     dominant_reqs: int,
     cold_reqs: int,
     arrival_mode: str,
@@ -234,7 +295,7 @@ def run_client_once(
         "--server",
         base_url,
         "--dataset",
-        "synthetic",
+        dataset,
         "--arrival-mode",
         arrival_mode,
         "--rate",
@@ -247,15 +308,21 @@ def run_client_once(
         str(timeout),
         "--max-concurrency",
         str(max_concurrency),
-        "--dominant-reqs",
-        str(dominant_reqs),
-        "--cold-reqs",
-        str(cold_reqs),
+        "--max-reqs",
+        str(request_count),
         "--seed",
         str(seed),
         "--output",
         str(out_file),
     ]
+
+    if dataset == "synthetic":
+        cmd.extend([
+            "--dominant-reqs",
+            str(dominant_reqs),
+            "--cold-reqs",
+            str(cold_reqs),
+        ])
 
     print("[run]", " ".join(cmd))
     return run_cmd(cmd, capture=True)
@@ -286,6 +353,15 @@ def main() -> int:
     parser.add_argument("--rates", default="0.5,1.0,1.5")
     parser.add_argument("--ks", default="0.5,1.0")
     parser.add_argument("--request-counts", default="25,50")
+    parser.add_argument(
+        "--dataset",
+        choices=["synthetic", "loogle", "chatbot_arena"],
+        default="synthetic",
+        help=(
+            "Workload dataset for workload.client. "
+            "For non-synthetic datasets, request-count values are used as --max-reqs."
+        ),
+    )
     parser.add_argument("--cold-fraction", type=float, default=0.2)
     parser.add_argument("--arrival-mode", choices=["global", "per-client"], default="per-client")
     parser.add_argument("--timeout", type=float, default=600.0)
@@ -302,6 +378,12 @@ def main() -> int:
     ks = parse_float_list(args.ks)
     request_counts = parse_int_list(args.request_counts)
 
+    if args.reuse_existing_url and len(policies) > 1:
+        raise SystemExit(
+            "--reuse-existing-url points to a single deployed server policy. "
+            "Use one policy at a time with --reuse-existing-url, or remove it to auto-deploy per policy."
+        )
+
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.output_root) / f"modal_grid_{ts}"
     run_dir = out_dir / "runs"
@@ -314,18 +396,31 @@ def main() -> int:
             base_url = args.reuse_existing_url.rstrip("/")
             health = wait_for_health(base_url)
             print(f"[health] reuse url ok: {health}")
+            expected_policy = policies[0] if policies else ""
+            reported_policy = str(health.get("policy", ""))
+            if expected_policy and reported_policy and reported_policy != expected_policy:
+                raise SystemExit(
+                    f"--reuse-existing-url policy mismatch: requested '{expected_policy}', "
+                    f"but endpoint reports '{reported_policy}' in /healthz."
+                )
 
             for policy, rate, kval, req_count in itertools.product(policies, rates, ks, request_counts):
-                cold = int(round(req_count * args.cold_fraction))
-                cold = min(max(cold, 1), req_count - 1)
-                dominant = req_count - cold
+                if args.dataset == "synthetic":
+                    cold = int(round(req_count * args.cold_fraction))
+                    cold = min(max(cold, 1), req_count - 1)
+                    dominant = req_count - cold
+                else:
+                    cold = 0
+                    dominant = 0
 
                 out_file = run_dir / f"{policy}_r{rate}_k{kval}_n{req_count}.jsonl"
                 res = run_client_once(
                     base_url=base_url,
                     policy=policy,
+                    dataset=args.dataset,
                     rate=rate,
                     k=kval,
+                    request_count=req_count,
                     dominant_reqs=dominant,
                     cold_reqs=cold,
                     arrival_mode=args.arrival_mode,
@@ -335,7 +430,40 @@ def main() -> int:
                     out_file=out_file,
                 )
 
-                row = summarize_jsonl(out_file, policy, rate, kval, req_count, dominant, cold)
+                if res.returncode != 0 or not out_file.exists():
+                    run_error = format_run_error(res)
+                    print(
+                        f"[error] policy={policy} rate={rate} k={kval} n={req_count} "
+                        f"return_code={res.returncode}; output not available"
+                    )
+                    print(run_error)
+                    if args.dataset == "chatbot_arena":
+                        print(
+                            "[hint] chatbot_arena is a gated HF dataset; authenticate first "
+                            "(e.g., `huggingface-cli login` or set HUGGINGFACE_HUB_TOKEN)."
+                        )
+                    row = make_failed_row(
+                        policy,
+                        args.dataset,
+                        rate,
+                        kval,
+                        req_count,
+                        dominant,
+                        cold,
+                        out_file,
+                        run_error,
+                    )
+                else:
+                    row = summarize_jsonl(
+                        out_file,
+                        policy,
+                        args.dataset,
+                        rate,
+                        kval,
+                        req_count,
+                        dominant,
+                        cold,
+                    )
                 row["return_code"] = res.returncode
                 row["server_url"] = base_url
                 summaries.append(row)
@@ -346,6 +474,8 @@ def main() -> int:
                 )
         else:
             for policy in policies:
+                # Force a fresh app session for each policy so deploy-time env changes are applied.
+                stop_service(args.service_name)
                 base_url = deploy_service(
                     service_name=args.service_name,
                     policy=policy,
@@ -353,18 +483,30 @@ def main() -> int:
                 ).rstrip("/")
                 health = wait_for_health(base_url)
                 print(f"[health] {policy}: {health}")
+                reported_policy = str(health.get("policy", ""))
+                if reported_policy and reported_policy != policy:
+                    raise RuntimeError(
+                        f"Deployed policy mismatch: expected '{policy}', got '{reported_policy}'. "
+                        "Try a unique --service-name or stop the app and retry."
+                    )
 
                 for rate, kval, req_count in itertools.product(rates, ks, request_counts):
-                    cold = int(round(req_count * args.cold_fraction))
-                    cold = min(max(cold, 1), req_count - 1)
-                    dominant = req_count - cold
+                    if args.dataset == "synthetic":
+                        cold = int(round(req_count * args.cold_fraction))
+                        cold = min(max(cold, 1), req_count - 1)
+                        dominant = req_count - cold
+                    else:
+                        cold = 0
+                        dominant = 0
 
                     out_file = run_dir / f"{policy}_r{rate}_k{kval}_n{req_count}.jsonl"
                     res = run_client_once(
                         base_url=base_url,
                         policy=policy,
+                        dataset=args.dataset,
                         rate=rate,
                         k=kval,
+                        request_count=req_count,
                         dominant_reqs=dominant,
                         cold_reqs=cold,
                         arrival_mode=args.arrival_mode,
@@ -374,7 +516,40 @@ def main() -> int:
                         out_file=out_file,
                     )
 
-                    row = summarize_jsonl(out_file, policy, rate, kval, req_count, dominant, cold)
+                    if res.returncode != 0 or not out_file.exists():
+                        run_error = format_run_error(res)
+                        print(
+                            f"[error] policy={policy} rate={rate} k={kval} n={req_count} "
+                            f"return_code={res.returncode}; output not available"
+                        )
+                        print(run_error)
+                        if args.dataset == "chatbot_arena":
+                            print(
+                                "[hint] chatbot_arena is a gated HF dataset; authenticate first "
+                                "(e.g., `huggingface-cli login` or set HUGGINGFACE_HUB_TOKEN)."
+                            )
+                        row = make_failed_row(
+                            policy,
+                            args.dataset,
+                            rate,
+                            kval,
+                            req_count,
+                            dominant,
+                            cold,
+                            out_file,
+                            run_error,
+                        )
+                    else:
+                        row = summarize_jsonl(
+                            out_file,
+                            policy,
+                            args.dataset,
+                            rate,
+                            kval,
+                            req_count,
+                            dominant,
+                            cold,
+                        )
                     row["return_code"] = res.returncode
                     row["server_url"] = base_url
                     summaries.append(row)

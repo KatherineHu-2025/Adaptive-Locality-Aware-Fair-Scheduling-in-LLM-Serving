@@ -158,7 +158,7 @@ def main() -> int:
     ]
 
     print("[probe] running:", " ".join(cmd))
-    res = subprocess.run(cmd, text=True, check=False)
+    res = subprocess.run(cmd, text=True, encoding="utf-8", errors="replace", check=False)
 
     health_after = fetch_json(f"{base}/healthz")
     aimd_after = fetch_json(f"{base}/aimd?{parse.urlencode({'limit': 20})}")

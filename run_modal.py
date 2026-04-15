@@ -260,7 +260,14 @@ def run_experiment(
         "--model",      MODEL_NAME,
     ]
 
-    result = subprocess.run(cmd, cwd="/workspace", capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        cwd="/workspace",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
     if result.returncode != 0:
         return {"error": result.stderr, "stdout": result.stdout}
@@ -298,7 +305,14 @@ def run_benchmark(
         "--model",   MODEL_NAME,
     ]
 
-    result = subprocess.run(cmd, cwd="/workspace", capture_output=True, text=True)
+    result = subprocess.run(
+        cmd,
+        cwd="/workspace",
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
     if result.returncode != 0:
         return {"error": result.stderr}
@@ -334,7 +348,14 @@ def run_pareto_sweep(dataset: str = "synthetic", rate: float = 3.0) -> list[dict
             "--q",       str(cfg.get("q", 4000)),
             "--model",   MODEL_NAME,
         ]
-        r = subprocess.run(cmd, cwd="/workspace", capture_output=True, text=True)
+        r = subprocess.run(
+            cmd,
+            cwd="/workspace",
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
         if r.returncode == 0:
             row = json.loads(r.stdout)
             row.update(cfg)
