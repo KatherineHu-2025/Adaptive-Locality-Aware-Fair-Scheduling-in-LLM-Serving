@@ -8,6 +8,7 @@ the AIMD controller to dynamically adjust the DLPM quantum Q.
 
 from __future__ import annotations
 
+import json
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -113,6 +114,9 @@ class AIMDConfig:
     # How often to re-evaluate (every N calls to step())
     control_interval: int = 50
 
+    # Optional: append JSONL records of Q updates for runtime debugging.
+    debug_log_path: str = ""
+
 
 class AIMDController:
     """
@@ -148,6 +152,21 @@ class AIMDController:
 
         self.current_Q = new_Q
         self.history.append((time.perf_counter(), new_Q, jain, p99_ms))
+
+        if self.config.debug_log_path:
+            try:
+                with open(self.config.debug_log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({
+                        "t": time.perf_counter(),
+                        "step": self._step_count,
+                        "Q": float(new_Q),
+                        "jain": float(jain),
+                        "p99_ttft_ms": float(p99_ms),
+                        "violated": bool(violated),
+                    }) + "\n")
+            except Exception:
+                # Never break scheduler progress due to debug logging.
+                pass
 
     def get_Q(self) -> float:
         return self.current_Q

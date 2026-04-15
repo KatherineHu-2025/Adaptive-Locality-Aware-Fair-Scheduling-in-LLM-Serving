@@ -43,3 +43,8 @@ figures/
 # Secrets / Modal config
 .modal.toml
 *.env
+
+# Allow committed AIMD benchmark plots for documentation/sharing
+!docs/
+!docs/plots/
+!docs/plots/*.png

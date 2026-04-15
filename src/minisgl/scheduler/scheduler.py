@@ -81,6 +81,13 @@ class Scheduler(SchedulerIOMixin):
         self.telemetry = SlidingWindowTelemetry(window_size=telemetry_window)
         self.controller: Optional[AIMDController] = None
         if policy == "adaptive_dlpm":
+            aimd_debug_log = os.environ.get("AIMD_DEBUG_LOG_PATH", "/tmp/minisgl_aimd_history.jsonl")
+            if aimd_debug_log:
+                try:
+                    # Fresh file on startup so each run has clean AIMD history.
+                    open(aimd_debug_log, "w", encoding="utf-8").close()
+                except Exception:
+                    pass
             aimd_cfg = AIMDConfig(
                 Q_min=float(os.environ.get("AIMD_Q_MIN", "500")),
                 Q_max=float(os.environ.get("AIMD_Q_MAX", "64000")),
@@ -90,6 +97,7 @@ class Scheduler(SchedulerIOMixin):
                 additive_step=float(os.environ.get("AIMD_ADDITIVE_STEP", "500")),
                 multiplicative_factor=float(os.environ.get("AIMD_MULT_FACTOR", "0.5")),
                 control_interval=int(os.environ.get("AIMD_CONTROL_INTERVAL", "50")),
+                debug_log_path=aimd_debug_log,
             )
             self.controller = AIMDController(aimd_cfg, self.telemetry)
             logger.info_rank0("Adaptive DLPM: AIMD controller initialized (Q_init=%.0f)", aimd_cfg.Q_init)
@@ -263,6 +271,12 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
+        # Track cache match depth at scheduling time for telemetry analysis.
+        for req in batch.reqs:
+            if req.uid in self._req_meta:
+                client_id, arrival_time, _ = self._req_meta[req.uid]
+                self._req_meta[req.uid] = (client_id, arrival_time, int(req.cached_len))
+
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)

@@ -267,6 +267,27 @@ J = 1.0 means all clients were served equally. J = 1/n means one client got ever
 
 ---
 
+## Latest AIMD A/B Snapshot (2026-04-14)
+
+Most recent strict-vs-relaxed Jain-threshold results and analysis are documented in:
+- [relaxed_vs_strict_jain_summary.md](relaxed_vs_strict_jain_summary.md)
+
+Generated plots from that run:
+- [docs/plots/plot_strict_v2.png](docs/plots/plot_strict_v2.png)
+- [docs/plots/plot_relaxed_v2.png](docs/plots/plot_relaxed_v2.png)
+- [docs/plots/plot_ab_compare_v2.png](docs/plots/plot_ab_compare_v2.png)
+
+One-line takeaway from this snapshot:
+- Strict threshold (`0.95`) achieved much lower TTFT (P50/P99) than relaxed (`0.50`) at nearly identical total throughput.
+
+To regenerate only the plots from existing artifacts (without redeploying):
+
+```powershell
+python run_aimd_ab_test_v2.py --plot-only --server https://<your-modal-url>
+```
+
+---
+
 ## What's Still To Do
 
 - [ ] **Dataset parsers** — download and parse Chatbot Arena / LooGLE traces
