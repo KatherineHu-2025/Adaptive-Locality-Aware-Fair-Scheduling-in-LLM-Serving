@@ -314,12 +314,6 @@ class Scheduler(SchedulerIOMixin):
         self.cache_manager.cache_req(req, finished=True)
 
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
-        # Track cache match depth at scheduling time for telemetry analysis.
-        for req in batch.reqs:
-            if req.uid in self._req_meta:
-                client_id, arrival_time, _ = self._req_meta[req.uid]
-                self._req_meta[req.uid] = (client_id, arrival_time, int(req.cached_len))
-
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
         batch.positions = _make_positions(batch, self.device)
