@@ -70,7 +70,7 @@ image = (
         "datasets",
         "requests",
     )
-    .add_local_dir(".", remote_path="/workspace", ignore=[".git", "mini-sglang"], copy=True)
+    .add_local_dir(".", remote_path="/workspace", ignore=[".git", "mini-sglang", "venv", "**/__pycache__", "**/*.pyc"], copy=True)
     # Apply our scheduler patches on top of the cloned repo
     .run_commands("bash /workspace/apply_patches.sh /opt/mini-sglang")
 )

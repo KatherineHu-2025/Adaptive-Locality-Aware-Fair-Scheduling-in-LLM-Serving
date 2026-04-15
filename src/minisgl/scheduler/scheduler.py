@@ -34,7 +34,7 @@ from .io import SchedulerIOMixin
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 # --- NEW ---
-from .telemetry import AIMDConfig, AIMDController, CompletedReqRecord, SlidingWindowTelemetry
+from .telemetry import AIMDConfig, AIMDController, CompletedReqRecord, RequestLogger, SlidingWindowTelemetry
 from .policies import DeficitState
 
 if TYPE_CHECKING:
@@ -114,10 +114,16 @@ class Scheduler(SchedulerIOMixin):
         logger.info_rank0("Scheduler policy: %s (static_Q=%.0f)", policy, static_Q)
 
         # --- NEW: per-request metadata for telemetry ---
-        # uid → (client_id, arrival_time, cached_len_at_scheduling)
-        self._req_meta: Dict[int, Tuple[str, float, int]] = {}
+        # uid → (client_id, arrival_time, orig_prompt_len, cached_len, q_at_scheduling)
+        self._req_meta: Dict[int, Tuple[str, float, int, int, float]] = {}
         # uid → first_token_time (set when prefill result is processed)
         self._first_token_time: Dict[int, float] = {}
+
+        # --- NEW: file logger (opt-in via MINISGL_LOG_DIR) ---
+        log_dir = os.environ.get("MINISGL_LOG_DIR", "")
+        self._req_logger: Optional[RequestLogger] = (
+            RequestLogger(log_dir, policy) if log_dir else None
+        )
 
         self.finished_reqs: Set[Req] = set()
         self.tokenizer = load_tokenizer(config.model_path)
@@ -176,9 +182,18 @@ class Scheduler(SchedulerIOMixin):
                 data = self.overlap_loop(data)
 
     def shutdown(self) -> None:
+        self._flush_logs()
         torch.cuda.synchronize(self.device)
         self.sync_all_ranks()
         self.engine.shutdown()
+
+    def _flush_logs(self) -> None:
+        """Flush Q trajectory to CSV and close the request log file."""
+        if self._req_logger is None:
+            return
+        if self.controller is not None:
+            self._req_logger.flush_q_history(self.controller.history)
+        self._req_logger.close()
 
     def _process_last_data(self, last_data: ForwardData | None) -> None:
         if last_data is None:
@@ -222,17 +237,34 @@ class Scheduler(SchedulerIOMixin):
                     self._free_req_resources(req)
                     new_finished_reqs.add(req)
 
-                    # --- NEW: record completed request to telemetry ---
+                    # --- NEW: record completed request to telemetry + file log ---
                     if req.uid in self._req_meta:
-                        client_id, arrival_time, cached_len = self._req_meta.pop(req.uid)
+                        client_id, arrival_time, orig_prompt_len, cached_len, q_at_sched = self._req_meta.pop(req.uid)
                         first_tok = self._first_token_time.pop(req.uid, now)
+                        ttft_s = first_tok - arrival_time
+                        output_tokens = len(req.input_ids) - orig_prompt_len
+                        tpot_ms = (
+                            (now - first_tok) * 1000.0 / (output_tokens - 1)
+                            if output_tokens > 1 else 0.0
+                        )
                         self.telemetry.record(CompletedReqRecord(
                             client_id=client_id,
                             arrival_time=arrival_time,
-                            ttft=first_tok - arrival_time,
-                            prompt_len=len(req.input_ids),
+                            ttft=ttft_s,
+                            prompt_len=orig_prompt_len,
                             cached_len=cached_len,
                         ))
+                        if self._req_logger is not None:
+                            self._req_logger.log_request(
+                                req_id=req.uid,
+                                client_id=client_id,
+                                arrival_time=arrival_time,
+                                ttft_ms=ttft_s * 1000.0,
+                                tpot_ms=tpot_ms,
+                                prompt_len=orig_prompt_len,
+                                cached_len=cached_len,
+                                q_at_scheduling=q_at_sched,
+                            )
 
                 elif batch.is_prefill:
                     self.cache_manager.cache_req(req, finished=False)
@@ -262,8 +294,8 @@ class Scheduler(SchedulerIOMixin):
                 )
             # --- NEW: store metadata for telemetry before adding to queue ---
             client_id = msg.client_id if msg.client_id else str(msg.uid)
-            self._req_meta[msg.uid] = (client_id, time.perf_counter(), 0)
-            # cached_len is unknown until scheduling — updated in schedule_next_batch
+            # orig_prompt_len captured now; cached_len and q_at_scheduling filled at scheduling
+            self._req_meta[msg.uid] = (client_id, time.perf_counter(), len(msg.input_ids), 0, 0.0)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
@@ -313,10 +345,11 @@ class Scheduler(SchedulerIOMixin):
         # the cache match. cached_len was stored as 0 at arrival time because the
         # radix-tree lookup only happens during scheduling.
         if batch.is_prefill:
+            q_now = self.controller.get_Q() if self.controller is not None else 0.0
             for req in batch.reqs:
                 if not isinstance(req, ChunkedReq) and req.uid in self._req_meta:
-                    client_id, arrival_time, _ = self._req_meta[req.uid]
-                    self._req_meta[req.uid] = (client_id, arrival_time, req.cached_len)
+                    client_id, arrival_time, orig_prompt_len, _, _ = self._req_meta[req.uid]
+                    self._req_meta[req.uid] = (client_id, arrival_time, orig_prompt_len, req.cached_len, q_now)
         return self._prepare_batch(batch)
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
