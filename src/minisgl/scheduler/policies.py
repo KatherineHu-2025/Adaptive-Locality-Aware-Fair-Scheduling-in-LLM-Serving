@@ -37,36 +37,49 @@ VALID_POLICIES = {"lpm", "dlpm", "adaptive_dlpm", "fcfs"}
 @dataclass
 class DeficitState:
     """
-    Tracks per-client deficit for DLPM.
+    Tracks per-client deficit counter for DLPM (Algorithm 1 in the paper).
 
-    deficit[client_id] = cumulative prompt tokens that were NOT served to this
-    client across all past scheduling rounds (opportunity cost). Clients whose
-    deficit is within Q of the minimum-deficit client are eligible for prefix-
-    locality-based selection.
+    q[client_id] is the remaining service budget for each client in the
+    current cycle.  Mirrors the paper's q_i:
+      - Initialised to 0 when a client first appears.
+      - A request from client i is eligible to be scheduled when q_i > 0.
+      - After a prefill step: q_i -= w_e * extend_length(r)  (paper line 23)
+      - After each decode step: q_i -= w_q * output_tokens   (paper line 26)
+      - When ALL active clients have q_i <= 0, every client is replenished
+        by Q^u (CHECKREFILL, paper lines 3-8).
+
+    We_e = 1, w_q = 2 following OpenAI pricing as in the paper (§3).
     """
-    deficit: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    q: Dict[str, float] = field(default_factory=lambda: defaultdict(float))
+    W_E: float = 1.0   # weight for extend (non-cached prefill) tokens
+    W_Q: float = 2.0   # weight for output tokens
 
-    def update(
-        self,
-        pending_list: List[PendingReq],
-        served_client_ids: set,
-    ) -> None:
-        """
-        Called after each scheduling round.
-        Clients whose request was NOT served accumulate deficit equal to their
-        prompt length (tokens they deserved but didn't get).
-        Served clients have their deficit reset to 0.
-        """
-        for req in pending_list:
-            if req.client_id in served_client_ids:
-                self.deficit[req.client_id] = 0.0
-            else:
-                self.deficit[req.client_id] += req.input_len
+    def register(self, client_id: str) -> None:
+        """Called when a new client is first seen (paper line 12)."""
+        if client_id not in self.q:
+            self.q[client_id] = 0.0
 
-    def min_deficit(self, client_ids) -> float:
-        if not client_ids:
-            return 0.0
-        return min(self.deficit[c] for c in client_ids)
+    def needs_refill(self, active_client_ids: set) -> bool:
+        """True when all active clients have q_i <= 0 (CHECKREFILL condition)."""
+        return all(self.q[c] <= 0 for c in active_client_ids)
+
+    def refill(self, active_client_ids: set, Q: float) -> None:
+        """Replenish every exhausted client by Q (CHECKREFILL body, paper line 7)."""
+        for c in active_client_ids:
+            if self.q[c] <= 0:
+                self.q[c] += Q
+
+    def deduct_prefill(self, client_id: str, extend_len: int) -> None:
+        """Deduct extend-token cost after a request is added to the batch (paper line 23)."""
+        self.q[client_id] -= self.W_E * extend_len
+
+    def deduct_decode(self, client_id: str, output_tokens: int) -> None:
+        """Deduct output-token cost after each decode step (paper line 26)."""
+        self.q[client_id] -= self.W_Q * output_tokens
+
+    def is_eligible(self, client_id: str) -> bool:
+        """A client may be scheduled when q_i > 0 (paper line 21)."""
+        return self.q[client_id] > 0
 
 
 # ---------------------------------------------------------------------------
@@ -125,28 +138,23 @@ def reorder_pending_list(
 
     if policy in ("dlpm", "adaptive_dlpm"):
         assert deficit_state is not None, "DeficitState required for DLPM policies"
-        waiting_clients = {req.client_id for req in pending_list}
-        min_def = deficit_state.min_deficit(waiting_clients)
 
-        # Eligible: clients within Q of the minimum-deficit client
-        eligible = [
-            req for req in pending_list
-            if deficit_state.deficit[req.client_id] <= min_def + Q
-        ]
-        ineligible = [
-            req for req in pending_list
-            if deficit_state.deficit[req.client_id] > min_def + Q
-        ]
+        # Ensure every waiting client is registered (paper line 12)
+        for req in pending_list:
+            deficit_state.register(req.client_id)
 
-        if not eligible:
-            # Fallback: serve the most-starved client (min deficit)
-            eligible = sorted(
-                pending_list,
-                key=lambda r: deficit_state.deficit[r.client_id],
-            )
-            ineligible = []
+        active_clients = {req.client_id for req in pending_list}
 
-        # Among eligible: LPM ordering; among ineligible: preserve FIFO
+        # CHECKREFILL: if no active client has q_i > 0, replenish all (paper lines 3-8)
+        if deficit_state.needs_refill(active_clients):
+            deficit_state.refill(active_clients, Q)
+
+        # Eligible = clients with q_i > 0 (paper line 21)
+        eligible = [req for req in pending_list if deficit_state.is_eligible(req.client_id)]
+        ineligible = [req for req in pending_list if not deficit_state.is_eligible(req.client_id)]
+
+        # Among eligible: LPM ordering (paper line 16: SORTBYPREFIX)
+        # Among ineligible: preserve FIFO (they will be served after the next refill)
         eligible_sorted = sorted(eligible, key=lambda r: scores[r.uid], reverse=True)
         return eligible_sorted + ineligible
 

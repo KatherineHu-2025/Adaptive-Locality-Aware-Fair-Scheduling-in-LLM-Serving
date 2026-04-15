@@ -213,25 +213,24 @@ class PrefillManager:
             return None
 
         # ------------------------------------------------------------------
-        # Step 4: rebuild pending_list (chunked first, then un-attempted)
+        # Step 4: rebuild pending_list
+        # `reqs` holds every Req successfully handed to the batch (including
+        # ChunkedReqs).  The corresponding pending_reqs are ordered[:len(reqs)].
+        # ordered[len(reqs):] includes the first request that hit the budget
+        # wall plus all un-attempted ones — all go back into the queue.
         # ------------------------------------------------------------------
-        # Requests that were attempted but not added (PrefillAdder ran out of
-        # budget) are put back; their order within the un-attempted tail is
-        # whatever `ordered` had (policy-determined).
-        self.pending_list = chunked_list + ordered[num_attempted:]
+        num_served = len(reqs)
+        self.pending_list = chunked_list + ordered[num_served:]
 
         # ------------------------------------------------------------------
-        # Step 5: update deficit state for DLPM policies
+        # Step 5: deduct deficit counters for DLPM policies
+        # (paper lines 23 and 26 — deduct extend tokens at prefill scheduling)
         # ------------------------------------------------------------------
         if self.policy in ("dlpm", "adaptive_dlpm"):
-            served_ids = {pending_req.client_id for pending_req in ordered[:num_attempted]
-                          if not isinstance(pending_req.chunked_req, ChunkedReq)}
-            # Actually track which pending_reqs produced a non-chunked Req
-            served_ids = set()
-            for pending_req, req in zip(ordered[:num_attempted], reqs):
-                if not isinstance(req, ChunkedReq):
-                    served_ids.add(pending_req.client_id)
-            self.deficit_state.update(ordered[:num_attempted], served_ids)
+            for pending_req, req in zip(ordered[:num_served], reqs):
+                # extend_len = non-cached tokens actually computed this step
+                extend_len = pending_req.input_len - req.cached_len
+                self.deficit_state.deduct_prefill(pending_req.client_id, extend_len)
 
         return Batch(reqs=reqs, phase="prefill")
 

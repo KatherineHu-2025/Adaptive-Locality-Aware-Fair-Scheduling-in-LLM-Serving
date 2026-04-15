@@ -206,6 +206,17 @@ class Scheduler(SchedulerIOMixin):
                 if batch.is_prefill and req.uid not in self._first_token_time:
                     self._first_token_time[req.uid] = now
 
+                # --- NEW: deduct output-token cost from deficit (paper line 26).
+                # Runs for every req in every batch (prefill produces the first
+                # token too). Must happen before the finished check so that
+                # requests completing this step are still counted.
+                if self.prefill_manager.policy in ("dlpm", "adaptive_dlpm"):
+                    if req.uid in self._req_meta:
+                        _client_id = self._req_meta[req.uid][0]
+                    else:
+                        _client_id = str(req.uid)
+                    self.prefill_manager.deficit_state.deduct_decode(_client_id, 1)
+
                 if finished and req not in self.finished_reqs:
                     self.decode_manager.remove_req(req)
                     self._free_req_resources(req)
@@ -296,7 +307,17 @@ class Scheduler(SchedulerIOMixin):
             self.prefill_manager.schedule_next_batch(self.prefill_budget)
             or self.decode_manager.schedule_next_batch()
         )
-        return self._prepare_batch(batch) if batch else None
+        if batch is None:
+            return None
+        # Fix: update cached_len in _req_meta now that PrefillAdder has resolved
+        # the cache match. cached_len was stored as 0 at arrival time because the
+        # radix-tree lookup only happens during scheduling.
+        if batch.is_prefill:
+            for req in batch.reqs:
+                if not isinstance(req, ChunkedReq) and req.uid in self._req_meta:
+                    client_id, arrival_time, _ = self._req_meta[req.uid]
+                    self._req_meta[req.uid] = (client_id, arrival_time, req.cached_len)
+        return self._prepare_batch(batch)
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
