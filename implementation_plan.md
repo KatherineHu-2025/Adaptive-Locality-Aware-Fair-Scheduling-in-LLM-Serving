@@ -303,40 +303,61 @@ History of `(wall_time, Q, jain, p99_ms)` is stored in `controller.history` for 
 
 ---
 
-### ⚠️ Step 2.4 — Log Q trajectory
+### ✅ Step 2.4 — Log Q trajectory
 
-Q history is stored in memory (`controller.history`). File-based logging (CSV/JSON per run) is not yet implemented — needed for generating the "Q over time" figure.
+`RequestLogger` implemented in [src/minisgl/scheduler/telemetry.py](src/minisgl/scheduler/telemetry.py). Activated via `MINISGL_LOG_DIR` env var. Writes:
+- `{log_dir}/requests_{policy}_{ts}.jsonl` — one line per completed request (TTFT, TPOT, cached_len, Q_at_scheduling)
+- `{log_dir}/q_trajectory_{ts}.csv` — Q history (wall_time, Q, jain, p99_ttft_ms)
+
+`AIMDController.step()` also writes live JSONL to `AIMD_DEBUG_LOG_PATH` for runtime monitoring.
 
 ---
 
-### ❌ Step 2.5 — Validate AIMD behavior on synthetic workload
+### ⚠️ Step 2.5 — Validate AIMD behavior on synthetic workload
 
-Requires a GPU run with the starvation workload (Step 1.6). Expected: Q should show a sawtooth pattern — climbing slowly when Jain is healthy, dropping sharply when the cold client is starved.
+**Partially observed.** AIMD Q trajectory was observed in dummy-weight runs: Q dropped from 4000 → 2000 → 1000 → 500 (floor) in response to low Jain Index. However:
+- Q never recovered (additive increase) — workload design issue: LooGLE `one_per_doc=True` assigns 1 req/client, so Jain stays at ~0.5 permanently
+- In real-weight LooGLE runs, AIMD showed additive increase (Q: 4000 → 4500 → 5000, `violated=false`)
+- Full sawtooth not yet demonstrated — requires high-load synthetic workload with dominant/cold client split
+
+**Remaining:** Run synthetic dataset at rate ≥ 2.0 req/s with dominant/cold split to trigger sawtooth.
 
 ---
 
 ### Week 2 Checkpoint
 
 - ✅ AIMD controller runs without blocking the scheduling hot path (lightweight, in-memory)
-- ⚠️ Q trajectory stored in memory — file logging not yet done
-- ❌ Synthetic starvation test shows sawtooth Q oscillation (requires GPU + workload client)
-- ❌ Adaptive DLPM outperforms static DLPM on Jain Index (requires experiments)
-- ❌ No regressions on LPM behavior (requires GPU smoke test confirmation)
+- ✅ Q trajectory file logging implemented (`RequestLogger`, `MINISGL_LOG_DIR`)
+- ⚠️ AIMD Q changes observed but full sawtooth not demonstrated (needs high-load synthetic run)
+- ⚠️ Adaptive DLPM vs static DLPM comparison done at low load — Adaptive DLPM not yet clearly winning
+- ✅ No regressions on LPM behavior (confirmed via smoke tests and end-to-end runs)
 
 ---
 
 ## 4. Week 3: Experiments and Ablations
 
-### Step 3.1 — Baseline runs ❌
+### ⚠️ Step 3.1 — Baseline runs
 
-Run all policy/Q combinations on Chatbot Arena + LooGLE + synthetic workload. Collect per-request CSV logs.
+All 4 policies (fcfs, lpm, dlpm, adaptive_dlpm) run on Chatbot Arena and LooGLE at rate=1.0 req/s.
+Static DLPM tested at Q=4000 only (paper sweeps Q=500, 2000, 8000, 32000 — not yet done).
 
-| Policy | Q |
-|---|---|
-| `lpm` | — |
-| `dlpm` | 500, 2000, 8000, 32000 |
-| `adaptive_dlpm` | dynamic |
-| `fcfs` | — |
+**Completed runs:**
+
+| Dataset | Policy | Rate | Result dir |
+|---|---|---|---|
+| Chatbot Arena (min_turns=2) | adaptive_dlpm, lpm, fcfs | 1.0 | `results/modal_grid_20260416_010102/` |
+| Chatbot Arena (min_turns=2) | dlpm (Q=4000) | 1.0 | `results/modal_grid_20260416_133620/` |
+| LooGLE (real weights) | adaptive_dlpm, lpm, fcfs | 1.0 | `results/loogle_real_weights_comparison/` |
+| LooGLE (real weights) | dlpm (Q=4000) | 1.0 | `results/modal_grid_20260416_134623/` |
+
+**Key findings so far:**
+- LPM causes severe cold-start starvation in Chatbot Arena (Turn-1 P99 = 37,926ms)
+- Adaptive DLPM halves LPM's starvation tail (P99 = 20,441ms, 46% reduction)
+- Static DLPM Q=4000 has catastrophic tail on LooGLE (P99 = 148,603ms) — Q too small for long-context prompts
+- FCFS competitive or wins at rate=1.0 req/s — DLPM advantage needs higher load
+- AIMD never triggered (0 updates) — control interval requires deeper queue than current load produces
+
+**Remaining:** Multi-Q sweep for static DLPM; synthetic workload; rate sweep ≥ 2.0 req/s.
 
 ---
 
@@ -346,9 +367,10 @@ Sweep `jain_threshold`, `ttft_slo_ms`, `additive_step`, `multiplicative_factor`,
 
 ---
 
-### Step 3.3 — Varying traffic intensity ❌
+### ⚠️ Step 3.3 — Varying traffic intensity
 
-Sweep arrival rate (1, 2, 3, 5, 8 req/sec) for best AIMD config. Show graceful degradation.
+Only rate=1.0 req/s tested so far. At this rate, queues are shallow and FCFS is competitive.
+**Remaining:** Sweep rates 2.0, 3.0 req/s on both datasets to stress the scheduler and trigger AIMD.
 
 ---
 
@@ -361,21 +383,28 @@ Adaptive DLPM should auto-adjust Q at the shift point. This is the headline expe
 
 ---
 
-### Step 3.5 — Generate figures ❌
+### ⚠️ Step 3.5 — Generate figures
 
-- **Figure 1:** Pareto frontier (Throughput vs. Jain Index)
-- **Figure 2:** Q over time with Jain overlay (AIMD sawtooth)
-- **Figure 3:** CDF of TTFT by policy
-- **Figure 4:** Per-client max wait time (starvation bar chart)
+Figures generated for current results. Still missing sawtooth and pareto.
+
+| Figure | Status | Location |
+|---|---|---|
+| TTFT CDF by policy (Chatbot Arena) | ✅ | `docs/plots/chatbot_arena_real_weights/` |
+| TTFT by turn — starvation view (Chatbot Arena) | ✅ | `docs/plots/chatbot_arena_real_weights/chatbot_arena_starvation_turn1.png` |
+| TTFT CDF + tail latency view (LooGLE) | ✅ | `docs/plots/loogle_real_weights/` |
+| Pareto frontier (Throughput vs. Jain Index) | ❌ | Needs Jain metric fix + high-load runs |
+| Q over time with Jain overlay (AIMD sawtooth) | ❌ | Needs high-load synthetic run to trigger AIMD |
+| Per-client max wait time (starvation bar chart) | ❌ | Needs synthetic dominant/cold workload |
 
 ---
 
 ### Week 3 Checkpoint
 
-- ❌ All baseline runs complete and logged
-- ❌ AIMD hyperparameters tuned
-- ❌ All four figures drafted
-- ❌ Adaptive DLPM Pareto-dominates or matches static DLPM across ≥2 workload types
+- ⚠️ Baseline runs done for Chatbot Arena + LooGLE at rate=1.0, all 4 policies
+- ❌ Multi-Q sweep for static DLPM not done
+- ❌ AIMD hyperparameters not swept
+- ⚠️ Figures partially complete — TTFT/starvation plots done; sawtooth + pareto pending
+- ❌ Adaptive DLPM Pareto-dominance not yet demonstrated (needs higher load + Jain metric fix)
 
 ---
 
@@ -418,7 +447,16 @@ Structure (MLSys 2025 format):
 | [src/minisgl/scheduler/prefill.py](src/minisgl/scheduler/prefill.py) | ✅ | Injects policy reordering + deficit updates into batching loop |
 | [src/minisgl/scheduler/scheduler.py](src/minisgl/scheduler/scheduler.py) | ✅ | Wires telemetry + AIMD + records TTFT per request |
 
-### Log format (one JSON line per completed request) — target for Step 2.4
+### Additional infrastructure (added during implementation)
+
+| File | Status | What it does |
+|---|---|---|
+| [run_modal_service.py](run_modal_service.py) | ✅ | Persistent Modal ASGI endpoint; proxies `/generate`, `/healthz`, `/aimd` |
+| [benchmark_modal_service_grid.py](benchmark_modal_service_grid.py) | ✅ | Grid benchmark driver: deploys per policy, sweeps rate/k/count, writes CSV+JSON summary |
+| [workload/client.py](workload/client.py) | ✅ | Added `--min-turns` flag for Chatbot Arena multi-turn filtering |
+| [benchmark_modal_service_grid.py](benchmark_modal_service_grid.py) | ✅ | Jain metric fixed to use paper's service-rate formula (extend×1 + output×2) |
+
+### Log format (one JSON line per completed request — Step 2.4 ✅)
 
 ```json
 {
@@ -553,11 +591,12 @@ Policy and AIMD knobs are set via environment variables in `run_modal.py` (or pa
 
 ## 9. Risk Register
 
-| Risk | Likelihood | Mitigation |
-|---|---|---|
-| mini SGLang's scheduler API differs from assumed structure | Medium | Hook points were verified by reading the source (Step 1.2) |
-| OOM errors with long LooGLE prompts | Medium | Cap prompt length at GPU's max unchunked prefill size |
-| AIMD Q oscillates too fast / not at all | Medium | Tune `control_interval` and `multiplicative_factor` in Week 3 sweep |
-| Jain Index insensitive to starvation in our workload | Low | Also report max per-client wait time as a direct starvation metric |
-| Chatbot Arena traces don't have consistent client IDs | Low | Assign synthetic client IDs by conversation_id field |
-| Adaptive DLPM does not outperform best static Q | Low | Frame result as: adaptive Q finds the right Q automatically without human tuning — this is valuable even if peak performance is matched |
+| Risk | Likelihood | Status | Mitigation / Outcome |
+|---|---|---|---|
+| mini SGLang's scheduler API differs from assumed structure | Medium | ✅ Resolved | Hook points verified; `reorder_pending_list` approach works cleanly |
+| OOM errors with long LooGLE prompts | Medium | ⚠️ Partial | 4 extreme-length docs (>15K words) timeout at 600s; add `max_prompt_words` filter |
+| AIMD Q oscillates too fast / not at all | Medium | ⚠️ Active | AIMD never triggered at rate=1.0 req/s; needs higher load (≥2.0 req/s) to fire control interval |
+| Jain Index insensitive to starvation in our workload | Medium | ⚠️ Active | Client-side `cached_len` not returned by server; Jain identical across policies in current runs; need synthetic workload with repeated dominant/cold requests |
+| Chatbot Arena traces don't have consistent client IDs | Low | ✅ Resolved | `question_id` used as `client_id`; `--min-turns` filter added to get multi-turn conversations |
+| Adaptive DLPM does not outperform best static Q | Low | ⚠️ Unresolved | At rate=1.0 FCFS wins; at high load DLPM advantage expected — experiments pending |
+| Static DLPM Q=4000 too small for LooGLE long-context prompts | — | 🆕 Discovered | P99=148s on LooGLE; need to either sweep Q values or use per-workload tuning as motivation for adaptive approach |
