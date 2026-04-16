@@ -192,15 +192,28 @@ def summarize_jsonl(
     total_wall = max((float(r.get("arrival_time", 0.0)) for r in rows), default=0.0)
     total_tokens = sum(int(r.get("output_tokens", 0)) for r in success)
 
-    by_client_tokens: dict[str, int] = {}
+    # Jain Fairness Index — paper uses service tokens per client:
+    #   service_tokens = extend_tokens × 1 + output_tokens × 2
+    # where extend_tokens = tokens served from prefix cache (cached_len).
+    # If cached_len is missing (-1), fall back to output_tokens × 2 only.
+    by_client_service: dict[str, int] = {}
+    by_client_output: dict[str, int] = {}
     for r in success:
         cid = str(r.get("client_id", ""))
-        by_client_tokens[cid] = by_client_tokens.get(cid, 0) + int(r.get("output_tokens", 0))
+        out_tok = int(r.get("output_tokens", 0))
+        cached = int(r.get("cached_len", -1))
+        extend_tok = max(0, cached)  # 0 when unknown
+        service_tok = out_tok * 2 + extend_tok
+        by_client_service[cid] = by_client_service.get(cid, 0) + service_tok
+        by_client_output[cid] = by_client_output.get(cid, 0) + out_tok
 
-    jain = float("nan")
-    x = list(by_client_tokens.values())
-    if len(x) >= 2 and sum(v * v for v in x) > 0:
-        jain = (sum(x) ** 2) / (len(x) * sum(v * v for v in x))
+    def _jain(vals: list[int]) -> float:
+        if len(vals) < 2 or sum(v * v for v in vals) == 0:
+            return float("nan")
+        return (sum(vals) ** 2) / (len(vals) * sum(v * v for v in vals))
+
+    jain = _jain(list(by_client_service.values()))
+    jain_output = _jain(list(by_client_output.values()))
 
     return {
         "policy": policy,
@@ -219,7 +232,8 @@ def summarize_jsonl(
         "ttft_p95_ms": percentile(ttfts, 0.95),
         "ttft_p99_ms": percentile(ttfts, 0.99),
         "ttft_mean_ms": statistics.fmean(ttfts) if ttfts else float("nan"),
-        "jain_index": jain,
+        "jain_index": jain,           # paper metric: service tokens (extend×1 + output×2)
+        "jain_output_tokens": jain_output,  # simpler metric: raw output tokens only
         "run_error": "",
         "output_file": str(path),
     }
@@ -255,6 +269,7 @@ def make_failed_row(
         "ttft_p99_ms": float("nan"),
         "ttft_mean_ms": float("nan"),
         "jain_index": float("nan"),
+        "jain_output_tokens": float("nan"),
         "run_error": run_error,
         "output_file": str(output_file),
     }
@@ -287,6 +302,7 @@ def run_client_once(
     max_concurrency: int,
     seed: int,
     out_file: Path,
+    min_turns: int = 1,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
@@ -323,6 +339,9 @@ def run_client_once(
             "--cold-reqs",
             str(cold_reqs),
         ])
+
+    if dataset == "chatbot_arena" and min_turns > 1:
+        cmd.extend(["--min-turns", str(min_turns)])
 
     print("[run]", " ".join(cmd))
     return run_cmd(cmd, capture=True)
@@ -367,6 +386,8 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--max-concurrency", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--min-turns", type=int, default=1,
+                        help="chatbot_arena only: skip conversations with fewer turns than this (default 1 = all)")
     parser.add_argument("--use-dummy-weight", action="store_true", help="Use dummy weights in service (fast but gibberish text)")
     parser.add_argument("--stop-service-at-end", action="store_true")
     parser.add_argument("--reuse-existing-url", default="", help="Skip deploy and benchmark this existing service URL")
@@ -428,6 +449,7 @@ def main() -> int:
                     max_concurrency=args.max_concurrency,
                     seed=args.seed,
                     out_file=out_file,
+                    min_turns=args.min_turns,
                 )
 
                 if res.returncode != 0 or not out_file.exists():
@@ -514,6 +536,7 @@ def main() -> int:
                         max_concurrency=args.max_concurrency,
                         seed=args.seed,
                         out_file=out_file,
+                        min_turns=args.min_turns,
                     )
 
                     if res.returncode != 0 or not out_file.exists():

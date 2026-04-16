@@ -435,6 +435,8 @@ def _parse_args():
                    help="Per-request HTTP timeout in seconds")
     p.add_argument("--max-concurrency", type=int, default=64,
                    help="Maximum simultaneous in-flight requests")
+    p.add_argument("--min-turns", type=int, default=1,
+                   help="chatbot_arena only: skip conversations with fewer turns than this")
     return p.parse_args()
 
 
@@ -450,7 +452,7 @@ async def _main():
         specs = load_loogle(max_docs=args.max_reqs, one_per_doc=True)
     elif args.dataset == "chatbot_arena":
         from workload.dataset import load_chatbot_arena
-        specs = load_chatbot_arena(max_conversations=args.max_reqs)
+        specs = load_chatbot_arena(max_conversations=args.max_reqs, min_turns=args.min_turns)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 

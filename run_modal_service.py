@@ -78,7 +78,7 @@ image = (
         "datasets",
         "requests",
     )
-    .add_local_dir(".", remote_path="/workspace", ignore=[".git", "mini-sglang"], copy=True)
+    .add_local_dir(".", remote_path="/workspace", ignore=[".git", "mini-sglang", "venv", "**/__pycache__", "**/*.pyc"], copy=True)
     .run_commands("bash /workspace/apply_patches.sh /opt/mini-sglang")
 )
 
