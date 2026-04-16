@@ -1,0 +1,375 @@
+﻿Notes
+BatchLLM: Optimizing Large Batched LLM Inference with Global Prefix Sharing and Throughput-oriented Token Batching: https://arxiv.org/html/2412.03594v2 
+
+
+Locality-aware Fair Scheduling in LLM Serving
+https://arxiv.org/pdf/2501.14312
+
+
+Q: Why do we implement it on top of SG Lang rather than vLLM?
+Great question. The short answer is that SGLang has RadixAttention built in as a first-class citizen, which is exactly the signal our scheduler needs to read. Let me break down the comparison properly.
+________________
+
+
+The Core Reason: We Need to Read the Radix Tree
+Our entire scheduler depends on one operation at each scheduling step:
+"For this waiting request, how many of its prefix tokens are already cached?"
+That requires querying a live radix tree that reflects the current cache state. The two systems differ fundamentally in how they expose this.
+________________
+
+
+SGLang
+RadixAttention was invented by the SGLang team (the SGLang paper, 2024). So the radix tree is not a plugin or an afterthought — it is the core data structure of the cache manager. Concretely:
+* The radix tree is always on, always maintained, and always consistent with the physical KV blocks
+* There is a clean prefix_match(tokens) → cached_length API already exposed internally
+* The scheduler and the cache manager are in the same process, sharing the same in-memory tree — so a cache score lookup is just a Python function call, no IPC, no serialization
+For our project, computing cache_score(r) is essentially already implemented — we just need to call the existing prefix match at scheduling time and use the result to reorder the queue.
+________________
+
+
+vLLM
+vLLM has prefix caching (added in v0.2+), but it works differently from RadixAttention in ways that matter for us:
+* vLLM's prefix cache uses a hash map keyed on token block hashes, not a radix tree. There is no tree to walk — you check if a block-aligned prefix chunk is cached, but you don't get a smooth "how many tokens are cached" signal. You get block-level granularity (e.g., blocks of 16 tokens), which is coarser.
+* The prefix cache is more tightly coupled to the block allocator, and less exposed as a queryable API at the scheduler layer. Accessing it from the scheduler requires reaching into lower-level internals.
+* vLLM's scheduler was designed around FCFS + preemption and has less modularity for injecting a custom priority function without deeper refactoring.
+In short, in vLLM you'd have to build the thing we're trying to use, whereas in SGLang it already exists.
+________________
+
+
+Side-by-Side
+
+
+	SGLang
+	vLLM
+	Prefix cache structure
+	Radix tree (token-level granularity)
+	Hash map (block-level granularity)
+	Cache query API
+	Built-in prefix_match()
+	Requires reaching into block allocator
+	Scheduler modularity
+	Relatively clean Python, easy to inject priority
+	More coupled, harder to modify without side effects
+	Origin of RadixAttention
+	Invented here
+	Not native — prefix caching is a separate addition
+	Community/docs for our use case
+	Better aligned
+	Less aligned
+	________________
+
+
+The One Reason You Might Still Pick vLLM
+vLLM has a larger user base and more production deployments, so results on vLLM might be more broadly impactful. If the goal were to submit this as a research paper targeting industry adoption, vLLM would be the more visible platform.
+But for a 4-week course project where you want to actually implement and run experiments, SGLang gives you a much faster path to the interesting part — the scheduler design — without spending two weeks fighting the codebase to expose the cache state you need.
+Gemini Feedback
+Strategic Feedback & Corrections
+There is one critical area in your "Status Quo" section that needs adjustment before you submit this:
+* SGLang's Baseline Scheduler: The proposal states that SGLang's scheduler operates independently of the cache state and does not perform active co-scheduling of requests based on cache overlap. This is a misconception. SGLang's original architecture natively implements a Longest Prefix Match (LPM)[a] scheduler specifically designed to maximize RadixAttention cache hits. LPM behaves almost exactly like your proposed Greedy policy (PAS-G), prioritizing requests that share the longest cached prefix. * The Pivot: You do not need to change your core project idea, but you must correct the baseline. Instead of comparing your approach against a naive FCFS baseline, your baseline should be SGLang's native LPM.
+* The True Value of PAS-D: Because SGLang already essentially does PAS-G (Greedy), the true novelty of your project lies entirely in the PAS-D (Deadline-Aware) policy. LPM is notorious for causing starvation—cold-start requests can get perpetually delayed under heavy load if hot-cache requests keep arriving. By sweeping the deadline timeout $T$ to find the Pareto frontier of Time-to-First-Token (TTFT) versus cache hit rate, you are tackling a very real, unsolved starvation problem in production MLSys.
+* Revisiting the Cache Score Formula: Your proposed metric is $cache\_score(r) = \frac{cached\_prefix\_length(r)}{total\_prompt\_length(r)}$. Consider testing absolute prefix length alongside this percentage. A request with a 10-token prompt that is 100% cached saves far less absolute compute than a request with a 2000-token prompt that is 50% cached. To maximize the "Prefill Tokens Saved" metric, the scheduler likely needs to optimize for total absolute tokens saved rather than a percentage ratio.
+Related Work & Papers to Reference
+To strengthen Section 3, you should integrate the following papers and recent system architectures. They map perfectly to the latency-efficiency tradeoff you are exploring:
+* "LLM Query Scheduling with Prefix Reuse and Latency Constraints" (arXiv, Feb 2025): This is the most directly related theoretical work to your proposal. The authors mathematically model RadixAttention scheduling in online, burst-traffic regimes. They explicitly analyze the tradeoff you are targeting: how LPM maximizes goodput but risks severe latency/starvation for cold queries. They explore priority-based local schedulers to balance prefix reuse against waiting times.
+* "SGLang: Efficient Execution of Structured Language Model Programs" (Zheng et al., 2023/2024): You absolutely must cite the original SGLang paper. Pay special attention to their section outlining the Longest Prefix Match (LPM) scheduling algorithm, as this is the exact SOTA you are modifying and benchmarking against.
+* vLLM's Prefix Cache-Aware Scheduling (GitHub Issue #7883 / Recent vLLM updates): While your proposal notes vLLM uses an FCFS policy, vLLM has very recently implemented prefix-cache aware scheduling. It modifies their block manager to allocate scheduling budgets based on how many blocks are already cached, dynamically increasing the batch size when prefixes are shared. Referencing this shows you are up-to-date with bleeding-edge open-source merges.
+* "JointSerLoRA: Cache-Aware LoRA Inference Serving" (IEEE, 2024): While focused on LoRA adapters, this paper tackles a highly analogous problem. They design an adaptive batching scheduler that groups requests based on both prefix and adapter awareness to minimize TTFT and balance instance load.
+* Distributed Cache-Aware Routing (e.g., llm-d): For your future work section, you can mention frameworks like llm-d, which elevate this exact scheduling concept from a single-node Python scheduler to Kubernetes-level cluster routing, directing requests to specific pods based on where the longest prefix currently lives in distributed memory.
+Your evaluation metrics—KV Cache Hit Rate, TTFT, Throughput, and Prefill Tokens Saved—are perfectly chosen for this domain. Once you update the baseline to reflect SGLang's actual LPM behavior, the action plan will be exceptionally strong.
+
+
+Claude’s response to: Then how's our scheduler different if it's already implementing LPM?
+
+
+The Key Distinction: LPM for Cache Reuse vs. LPM for Scheduling Decisions
+SGLang's existing LPM does one thing: when a request is already selected to run, find and reuse whatever prefix is cached.
+The order is:
+Scheduler picks request → THEN radix tree does LPM → reuse whatever is cached
+Our contribution flips the dependency:
+Radix tree does LPM on ALL waiting requests → THEN scheduler uses those scores to decide WHO to pick
+SGLang's LPM is reactive — it fires after the scheduling decision is already made. Our scheduler makes LPM proactive — a first-class input to the scheduling decision itself.
+________________
+
+
+A Concrete Example of Why This Matters
+Say the batch has one open slot, and three requests are waiting:
+Request A: cache_score = 0.05  (cold, arrived 10ms ago)
+Request B: cache_score = 0.97  (hot, arrived 8ms ago)  
+Request C: cache_score = 0.12  (cold, arrived 5ms ago)
+What SGLang's existing scheduler does: Picks A — it arrived first. Then LPM runs on A, finds 5% cached, runs expensive prefill on the rest. B and C wait. The fact that B was nearly free to serve is invisible to the scheduler.
+What our scheduler does: Picks B — highest cache score, saves ~95% of prefill compute. A and C wait a little longer, but overall system throughput improves.
+SGLang's LPM would have given B the same cache reuse if it had been selected — but it never was, because the scheduler didn't know to prefer it.
+________________
+
+
+The Analogy
+Think of a supermarket checkout. SGLang's current behavior is like a cashier who processes whoever is next in line, and happens to scan their items quickly if they have fewer items. Our scheduler is like a cashier who looks down the whole line, spots the person with 2 items, and calls them forward — reducing total checkout time for everyone.
+The scanning speed (LPM / cache reuse) is the same in both cases. The difference is who gets called to the register.
+________________
+
+
+So What Exactly Are We Adding?
+Three things that don't exist in SGLang today:
+1. Pre-scheduling prefix scoring SGLang queries the radix tree per request, at execution time. We query it for all waiting requests, before selection — turning it from a per-request optimization into a global scheduling signal.
+2. A priority ordering based on cache score SGLang has no concept of "prefer cache-hot requests." We add a priority queue ordered by cache_score, replacing or augmenting FCFS.
+3. The deadline policy (PAS-D) This is entirely new. SGLang has no notion of holding a batch slot open to wait for a better request. The tradeoff between slot utilization and cache efficiency doesn't exist in the current system — we're introducing and studying it.
+
+
+
+
+Gemini’s Suggestion on What to Add
+To answer your second question first: No, SGLang does not natively implement a deadline-aware or slot-holding policy like your proposed PAS-D.
+SGLang’s core scheduler currently relies on a few straightforward queue-reordering policies: lpm (Longest Prefix Match), fcfs (First-Come-First-Serve), and shortest-extend-length. When configured to use lpm, the scheduler greedily reorders the waiting queue to prioritize requests with the most cached tokens.
+Because SGLang’s native lpm is purely greedy, it suffers from a massive, well-known systems flaw: Starvation. If a server is under heavy load and cache-hot requests keep arriving, cold-start requests get pushed to the back of the queue indefinitely, completely destroying tail latency (P99 Time-to-First-Token).
+This means your PAS-D (Deadline-Aware) policy is not only novel for SGLang, but it tackles a very real, bleeding-edge problem in production LLM serving.
+To elevate your project and guarantee it stands out for 15-442/642, here are three advanced mechanics you can build on top of your current proposal that SGLang hasn't done yet:
+1. Aging-Based Fairness (Deficit LPM)
+Instead of a hard deadline timeout like PAS-D, you can implement a dynamic priority score that balances cache efficiency with fairness. You can modify your cache score formula to include an "aging" factor:
+  
+
+As a cold request sits in the queue, its priority artificially inflates until it forces the scheduler to run it. You could benchmark your PAS-D (hard deadline) against this Aging-LPM (soft deadline) to see which yields a better Pareto frontier for TTFT vs. throughput.
+2. Eviction-Aware "Rescue" Scheduling
+Right now, SGLang’s RadixAttention uses a standard LRU (Least Recently Used) policy to evict KV cache blocks when memory fills up. You could make your scheduler eviction-aware.
+* If a waiting request requires a cached prefix that is sitting at the very end of the LRU queue (meaning it is about to be deleted on the next step), the scheduler aggressively prioritizes it.
+* By "rescuing" the block just before eviction, you save a massive amount of redundant compute that would have been required if the request was scheduled just one step later.
+3. Chunked Prefill Co-Scheduling
+SGLang recently introduced support for chunked prefill (breaking a massive cold-start prefill into smaller chunks computed across multiple forward passes). You could co-design your prefix-aware scheduler with chunked prefill.
+* The Idea: Instead of holding a batch slot completely open (wasting GPU compute while waiting for a hot request), the scheduler fills the remaining GPU memory budget with a chunk of a cold request.
+* You get the best of both worlds: the cache-hot requests get served immediately, but the cold requests make incremental progress instead of starving, smoothing out the latency spikes.
+Your proposal is already incredibly strong. If you focus your narrative heavily on solving the "LPM Starvation Problem" using these tunable latency-efficiency tradeoffs, you will have a fantastic systems paper on your hands.
+
+
+Claude’s response on if LPM starvation is a real problem and is PAS-D a possible direction to solve it
+
+The LPM starvation problem is a real, actively researched issue — not yet fully solved, but several mitigations exist. Let me break this down precisely.
+________________
+
+
+What is LPM and why does it cause starvation?
+In SGLang's RadixAttention, the default scheduling policy is Longest Prefix Match (LPM): at each scheduling step, the scheduler greedily picks the waiting request that shares the longest cached prefix with the current radix tree. This maximizes KV cache reuse and improves throughput — in the offline setting (all queries known upfront), LPM is theoretically optimal for cache reuse.
+The problem emerges in online, heavy-traffic settings. LPM is greedy and myopic: it repeatedly favors requests that match popular cached prefixes, while requests with mismatching or rare prefixes can sit in the queue indefinitely. Existing scheduling approaches like LPM can lead to large TTFT (time-to-first-token) spikes under heavy traffic arXiv, because a request unlucky enough to not match a hot prefix keeps getting deprioritized as new matching requests keep arriving.
+This is the classic starvation problem from OS scheduling, now reborn in LLM serving.
+There's also a related but distinct fairness problem: LPM fails to guarantee effective isolation among clients — a malicious or high-volume client can monopolize shared resources by sending a large number of requests with long identical prefixes, significantly degrading the performance experienced by other clients. arXiv
+Here's the landscape of the problem and solutions:
+V
+visualize show_widget
+________________
+
+
+Is it solved?
+Not fully. Here's the state of things:
+Theoretically: The scheduling problem with prefix reuse under TTFT constraints has been proven NP-hard. arXiv So you can't have a polynomial-time algorithm that's both optimal for cache reuse AND guarantees deadline/latency compliance simultaneously.
+Practically, several mitigations exist:
+1. k-LPM (arxiv 2502.04677, Feb 2025) — proposes a family of algorithms parameterized by k, where k=1 recovers LPM and k=∞ approaches FCFS. The goal is to exploit the benefits of LPM but mitigate its performance risks in high-load scenarios, resulting in superior performance for long-prompt, short-output queries where RadixAttention delivers significant efficiency gains. arXiv It essentially limits how aggressively the scheduler can deprioritize waiting requests.
+2. D2LPM / Locality-aware Fair Scheduling (arxiv 2501.14312, Jan 2025) — addresses the fairness angle. Preble performs slightly better than vanilla LPM due to its multi-level priority wait queue, which avoids starvation but cannot provide isolation and strict fairness guarantees. arXiv D2LPM improves on this by explicitly optimizing for prefix locality while maintaining client fairness bounds.
+3. VTC (Virtual Token Clock) — a fairness-first scheduler that prevents starvation but sacrifices locality/cache hit rate. Good for multi-tenant scenarios with strict isolation requirements.
+4. Decode priority scheduling — both vLLM and SGLang already prioritize running decode requests over new prefills, which helps with a different starvation scenario (decode requests being starved by large prefill bursts).
+________________
+
+
+Can PAS-D (deadline-aware / slot-holding) be implemented in SGLang?
+PAS-D isn't a widely published acronym in this exact form in the LLM serving literature — you may be referring to a deadline-aware scheduling policy akin to EDF (Earliest Deadline First) with slot reservation. The concept maps cleanly onto the k-LPM / aging approach. Here's how you'd implement it:
+The core idea would be: each waiting request is assigned a soft deadline based on its arrival time and an SLO target (e.g., TTFT ≤ 2s). A slot is reserved for it in the batch once its deadline approaches. The scheduler normally runs LPM, but any request within some threshold of its deadline gets deadline-promoted into the next batch regardless of prefix match length.
+Here's a sketch of how this would plug into SGLang's scheduler:
+python
+# SGLang scheduler hook (simplified)
+class DeadlineAwareLPMScheduler:
+    def __init__(self, deadline_slo_ms=2000, promotion_threshold_ms=500):
+        self.deadline_slo = deadline_slo_ms
+        self.promotion_threshold = promotion_threshold_ms
+
+
+    def get_next_batch(self, waiting_queue, radix_tree, current_time):
+        # Step 1: identify deadline-critical requests
+        promoted = [
+            req for req in waiting_queue
+            if (current_time - req.arrival_time) >= 
+               (self.deadline_slo - self.promotion_threshold)
+        ]
+
+
+        # Step 2: fill remaining slots with LPM
+        remaining_budget = MAX_BATCH_SIZE - len(promoted)
+        lpm_sorted = sorted(
+            [r for r in waiting_queue if r not in promoted],
+            key=lambda r: radix_tree.longest_prefix_match(r.tokens),
+            reverse=True
+        )
+
+
+        return promoted + lpm_sorted[:remaining_budget]
+Challenges in SGLang specifically:
+The SGLang scheduler runs in a tight overlapped loop (the zero-overhead scheduling from your lecture notes — run_batch and process_batch_result are interleaved). Injecting deadline logic has to be careful not to break the non-blocking contract. The right place to hook in is get_next_batch_to_run() in the scheduler. SGLang's RadixCache already exposes prefix length matching via the radix tree, so the LPM side is easy to intercept.
+The k-LPM paper's approach is essentially this but formalized: it uses an "aging" parameter where a request's effective priority is prefix_match_length - α * wait_time, allowing you to tune the starvation-vs-reuse tradeoff with a single knob. That's probably the cleanest way to implement PAS-D semantics in SGLang.
+Bottom line: LPM starvation is a genuine, theoretically hard problem that isn't fully solved. The research community is actively working on it (multiple papers in 2025). SGLang's architecture is amenable to deadline-aware extensions — the scheduler is Python-level and the radix tree is exposed. The k-LPM framework gives you the cleanest theoretical grounding for implementing a PAS-D-style policy.
+
+
+Gemini’s Response: Is the project too easy / existing work
+I'll be candid with you: No, this is absolutely not too easy for a 4-week project. Systems benchmarking is notoriously difficult. Designing a new scheduling policy is the easy part; proving that it works under realistic constraints is where the real engineering happens. To pull this off, you will have to:
+1. Dig into SGLang's codebase to modify the scheduler natively without breaking the existing continuous batching logic.
+2. Write a highly specific, synthetic multi-turn workload generator that actually forces the server into the exact edge cases you want to measure (e.g., triggering starvation and cache eviction simultaneously).
+3. Run extensive parameter sweeps across turn depth, batch size, and arrival rates to generate publication-quality Pareto curves.
+Given the complex debugging you handled with buffer pool managers and concurrent B+ trees in Bustub, managing the state of a concurrent scheduler in a live LLM serving environment is right in your wheelhouse, but it will easily consume your four weeks. It is perfectly scoped for a 15-442/642 final project.
+Existing Research on LLM Scheduling & Starvation
+The academic community has just started publishing heavily on this exact problem within the last year. Here are three excellent papers you can reference in your proposal that validate your approach to solving the starvation vs. prefix-hit-rate tradeoff:
+1. "Locality-aware Fair Scheduling in LLM Serving" (January 2026)
+* What it addresses: The authors explicitly point out that existing locality-aware scheduling algorithms in LLM serving frameworks tend to maximize the prefix cache hit rate without considering fair sharing among clients.
+* How they solve it: They introduce the Deficit Longest Prefix Match (DLPM) algorithm, which is designed to maintain a high degree of prefix locality alongside a fairness guarantee. They utilize a concept called delay scheduling, where a job that is due to be scheduled next for fairness reasons will wait a small amount of time if it cannot utilize local data, letting other jobs launch instead.
+2. "LLM Query Scheduling with Prefix Reuse and Latency Constraints" (September 2025)
+* What it addresses: This paper presents a formal theoretical framework for LLM query scheduling when using RadixAttention.
+* How they solve it: The authors establish that the scheduling problem with prefix reuse under Time-to-First-Token (TTFT) constraints is NP-hard. To manage this, they propose $k$-LPM, a hybrid scheduling algorithm that interpolates between a First-Come-First-Serve (FCFS) scheduler (where $k = 1$) and an LPM scheduler (where $k = \infty$) to balance prefix reuse and fairness.
+3. "Prompt-Aware Scheduling for Low-Latency LLM Serving" (October 2025)
+* What it addresses: While this focuses slightly more on the varying output lengths of LLMs rather than just prefix caching, it tackles the same core issue of scheduling efficiency and latency.
+* How they solve it: The authors introduce PARS (Prompt-Aware Ranking Scheduler), which approximates shortest-job-first (SJF) scheduling. PARS relies on a predictor trained via a pairwise learning-to-rank approach with margin ranking loss, allowing the system to dynamically prioritize shorter tasks to achieve lower latency with minimal overhead.
+You can absolutely frame your PAS-D (Deadline-Aware) policy as a practical, systems-level implementation of the theoretical tradeoffs discussed in the DLPM and $k$-LPM papers!
+
+
+
+
+Gemini’s Response to “does DLPM adapt well to changes in workloads? Do they have parameters that they tune/adapt throughout online serving, and could that be an area that we talk about where we hope to improve it?”
+This is a brilliant insight and an excellent angle for your proposal. You have identified the exact limitation of DLPM that makes it ripe for improvement in a systems project.
+Here are the answers to your questions based on the DLPM paper, and how you can frame this as the core contribution of your project:
+1. Does DLPM adapt well to changes in workloads?
+DLPM is designed to handle diverse workloads structurally (by tracking deficits to prevent strict starvation), but it does not adapt its underlying policy dynamically when the traffic distribution changes. If a system suddenly transitions from a period of highly homogeneous requests (where maximizing locality is safe and efficient) to a period of highly heterogeneous, disjoint requests (where starvation becomes a massive risk), DLPM's static configuration might struggle to find the optimal balance point.
+2. Do they have parameters that they tune throughout online serving?
+No, they do not. The core mechanism of DLPM relies on a hyperparameter Q (often referred to as the quantum or relaxation bound).
+* Q controls how much the scheduler is allowed to "relax" the fairness constraint in order to chase longest prefix matches.
+* A small Q enforces strict fairness (behaving closer to VTC).
+* A large Q heavily prioritizes locality and throughput (behaving closer to pure LPM).
+In the paper, the authors treat Q as a static hyperparameter. They evaluate different fixed values (e.g., Q=1000, Q=2000, Q=8000, Q=32000) to demonstrate a Pareto frontier between throughput and fairness, but they do not propose any mechanism to automatically tune Q during online serving.
+3. How to use this in your proposal
+This is exactly where your team can introduce a major improvement. In the real world, production LLM traffic is bursty and diurnal; a static Q that works perfectly at 2:00 PM might cause unacceptable tail latency at 8:00 PM.
+You can explicitly update the Problem and High-level implementation plans sections of your proposal to include an Adaptive Fairness Policy. Here is how you could phrase it:
+Addition to the Problem Statement:
+While DLPM successfully balances fairness and locality, it relies on a statically configured relaxation hyperparameter (Q). Under rapidly fluctuating online workloads, a static parameter cannot optimally navigate the Pareto frontier, either over-penalizing throughput during homogeneous traffic bursts or under-penalizing starvation during diverse traffic spikes. We ask: Can we design an adaptive scheduler that dynamically tunes the fairness-locality tradeoff at runtime based on real-time queue states?
+Addition to the Implementation Plan:
+* Adaptive Policy Controller: Implement a feedback loop in mini SGLang that monitors real-time system metrics (e.g., maximum request waiting time, queue depth, or prefix cache hit rate).
+* Dynamic Adjustment: If the P99 waiting time exceeds a specific Service-Level Objective (SLO), the scheduler dynamically tightens the fairness bound (equivalent to lowering Q). Conversely, if queue latency is healthy, the scheduler relaxes the bound to maximize prefix cache utilization and system throughput.
+Framing your project around an "Adaptive-DLPM" or an "Auto-Tuning Fairness Scheduler" elevates it from a simple re-implementation to a novel systems contribution. It perfectly bridges the gap between efficiency and practical, real-world deployment!
+
+
+Proposal
+* Title / Team members (name and andrew ID)
+   * Katherine Hu / yangh3
+   * Emily Ho / emilyho
+   * Quinn Zhu / annz
+* Introduction[b][c]: What is the key high-level motivation behind your project?
+   * In multi-tenant LLM serving, pure locality-aware scheduling (LPM) allows a dominant client with long shared prefixes to monopolize the GPU, starving other clients. DLPM addresses this by introducing a quantum parameter Q that enforces periodic fairness while preserving prefix locality.
+   * DLPM introduces a principled fairness–locality tradeoff by using a quantum parameter Q (and Q_w in D²LPM) to control how much a client can "spend" on prefix-local scheduling before fairness is enforced. As shown in Figure 1 of the paper, different values of Q sweep a Pareto frontier between throughput and fairness (Jain Index). However, Q is a fixed, manually chosen hyperparameter. The best value of Q varies significantly across workloads — high-prefix-reuse workloads benefit from a large Q (more locality), while bursty or adversarial workloads need a small Q (stricter fairness). No single static Q is optimal across all conditions. 
+* Problem[d]: What research questions is your project trying to answer? Clearly define the problem you are trying to solve. Include a precise description/background about the problem.
+   * The motivation is therefore: can we design an online adaptive controller that tunes Q dynamically in response to observed workload conditions, improving the fairness–locality tradeoff without manual configuration?
+      * RQ1: What observable workload metrics (e.g., prefix cache hit rate, per-client deficit counter divergence, queue wait times, Jain fairness index) are reliable signals that Q is misconfigured for the current workload?
+      * RQ2: Can an AIMD-based adaptive controller — increasing Q additively when fairness is within bounds and decreasing it multiplicatively when the Jain index drops below a threshold — track the optimal fairness–locality operating point without significant scheduling overhead?
+         * To implement the online controller, we plan to use a sliding window over the most recent N requests to continuously calculate P99 latency and client deficit. We will feed these real-time metrics into an AIMD (Additive Increase, Multiplicative Decrease) control loop, which will iteratively relax the Q parameter to maximize locality during healthy periods, and multiplicatively slash Q the moment the sliding window detects an impending starvation spike.
+
+
+* Status quo: You should research work related to your own. What problem did they solve and how does it relate to yours? How can you improve on what has already been done?
+   * VTC (fair scheduling algorithm): tracks “virtual counter” of tokens issued to each client, schedules the client with least tokens. Issue is lack of prefix awareness, which can lower throughput as it doesn’t take full advantage of the cached prefix
+   * VLLM’s first come first serve: fairness algorithm
+   * LPM in SGLang (locality aware scheduling): greedy algorithm that schedules the request with longest matching prefix. Good for reducing TTFT and improving throughput, but has a starvation problem. 
+   * Locality-aware Fair Scheduling in LLM Serving (DLPM / D^2LPM): it introduces the idea of deficiency: each client has a notion of how much service it should have gotten v.s. How much service it actually got. It keeps track of the fairness state for each client and finds the set of clients/requests are fair to pick. Then among those, it picks the one with the best prefix locality. It also has a hyperparameter Q that regulates how much they relax the fairness bound.
+D^2LPM is a distributed version that we probably don’t need to worry.
+   * Summary[e]: Existing approaches either enforce fairness at the cost of efficiency (VTC), maximize efficiency at the cost of fairness (LPM), or balance both in a static fashion (DLPM). This leaves room for possible improvements. Can we design an adaptive scheduler that dynamically tunes the fairness relaxation parameter (Q) based on real-time queue metrics to optimize both throughput and tail latency under fluctuating workloads?
+* High-level implementation plans: What datasets do you plan to use? How do you plan to implement and evaluate your ideas?
+   * Implementation
+      * Implement DLPM
+      * Building on top of mini SGlang because it has all the features we need (Radix Attention, chunked prefill, etc), and is much simpler 
+      * Add new scheduler policy that is fairness aware on top of mini SGlang (which currently uses LPM)
+      * Tune parameters regarding how important fairness vs. locality is (and maybe have an adaptive policy for this too)
+   * Experimental Setup
+      * Send a lot of multi turn requests to ensure the prefix is cached
+      * Periodically send a completely new request
+      * Real datasets:
+         * Chatbot Arena traces: shows multi turn requests and demonstrates the adaptive scheduler’s ability to handle chaotic, unpredictable traffic
+         * LooGLE (long-context QA): to deliberately induce severe starvation under LPM, proving that your fairness policy successfully rescues starved requests without catastrophic throughput drops.
+      * Both will be served using Poisson arrival process to test actual online serving instead of batched requests
+      * Will compare LPM, DLPM, and our adaptive DLPM for the below evaluation metrics
+   * Evaluation Metrics
+      * Throughput: measures system efficiency by counting the number of tokens processed per second
+      * Fairness: measures how evenly resources are distributed across clients using Jain’s Fairness Index (according to Locality-aware Fair Scheduling in LLM Serving paper)
+      * Latency: measures whether starvation is mitigated using P50/P99 for TTFT and Time Per Output Token (TPOT)
+      * Starvation-related metrics:
+         * Maximum waiting time per client
+         * Service disparity between clients
+      * Changes in Q over time: track how the adaptive policy updates Q as workload changes
+
+
+Plan
+Additional Suggestions
+* Disable chunk prefill because it makes state management more complicated 
+* Caveat: our context can’t be super duper long (as long as we keep our prompts short, we can still simulate multi turn convo and simulate a situation for starvation with no issue)
+   * Gemini: The Fix: Instead of an arbitrary small cap, find the absolute maximum sequence length your specific NVIDIA GPUs can handle in a single, unchunked prefill pass without throwing an Out of Memory (OOM) error.
+   * Why it works: If your GPU can swallow an 8k or 16k prompt in one go, that 16k prefix is still more than enough for pure LPM to unfairly prioritize that client over a new user with a 50-token prompt. You still get your starvation, but you avoid OOMs and avoid the nightmare of tracking partial deficit consumption across chunked steps
+Week 1 Task Breakdown (Gemini)
+
+
+Team Member
+	Domain
+	Specific Week 1 Responsibilities
+	Person 1
+	System & Scheduler Infrastructure
+	1. Setup & Verification: Deploy Mini SGLang and verify the existing FCFS and LPM policies function as expected out of the box.
+
+
+2. Static DLPM Implementation: Implement the "raw" DLPM policy with a fixed $Q$ parameter. This is the crucial baseline your adaptive controller will eventually replace.
+
+
+3. Benchmarking Logic: Set up the server-side benchmarking harness to easily toggle between FCFS, LPM, and Static DLPM policies during evaluation runs.
+	Person 2
+	Workload & Data Generation
+	1. Dataset Prep: Download Chatbot Arena Traces and LooGLE. Write parsing scripts to convert them into standard request formats.
+
+
+2. Arrival Process: Write a Python client script that sends requests to the Mini SGLang API using a Gamma process to simulate realistic, bursty traffic.
+
+
+3. Multi-turn Logic: Ensure the client script can simulate multi-turn chats by appending to previous prompts to stress-test the KV cache.
+	Person 3
+	Telemetry & Metrics
+	1. Sliding Window State: Implement an efficient, thread-safe data structure inside the scheduler to hold the last $N$ requests.
+
+
+2. Latency Tracking: Add timestamps to track submission time, TTFT, and completion time for each request.
+
+
+3. Deficit Tracking: Implement the logic to track how many tokens/requests each client has been served recently so the Jain Fairness Index can be calculated.
+	Integration Checkpoint (End of Week 1):
+By the end of the week, the goal is for Person 2's Gamma-process client to be firing realistic traffic at Person 1's server running the newly implemented Static DLPM, while Person 3's telemetry logs the resulting TTFT, TPOT, and client deficits. This ensures the entire pipeline is completely ready for the AIMD control loop in Week 2.
+
+
+Overall Plan (Gemini)
+4-Week Project Roadmap
+Week 1: Infrastructure Setup, Baselines, and Telemetry Scaffolding
+* Goal: Get the testing environment running, establish the baselines (FCFS, standard LPM, static DLPM), and build the telemetry hooks needed for your adaptive controller.
+* Key Deliverables: Mini SGLang running locally/on your cluster, datasets parsed and ready to feed via Gamma process, and metric-tracking data structures integrated into the scheduler.
+Week 2: Implementation of the Adaptive AIMD Controller
+* Goal: Build the core logic of your proposal.
+* Key Deliverables:
+   * Implement the sliding window over the last N requests.
+   * Calculate the Jain Fairness Index and P99 latency in real-time.
+   * Implement the AIMD control loop to dynamically adjust Q.
+   * Note: This graph illustrates the standard AIMD saw-tooth behavior you should expect to see when plotting your Q parameter over time as it hits fairness boundaries.
+Week 3: Experiments, Ablations, and Tuning
+* Goal: Run the evaluation workloads and tune your controller's hyperparameters.
+* Key Deliverables:
+   * Run Chatbot Arena and LooGLE traces under different traffic intensities.
+   * Tune the AIMD parameters (How fast should Q increase? How aggressive is the multiplicative decrease? What is the Jain Index threshold?).
+   * Collect all raw data for Throughput, Prefix Cache Hit Rate, P50/P99 TTFT, and Max Wait Time.
+Week 4: Analysis, Presentation, and Report Writing
+* Goal: Synthesize your findings into a compelling narrative and finalize deliverables.
+* Key Deliverables (First Half): Generate visualizations. You will need a Pareto frontier graph showing Throughput vs. Fairness, and a time-series graph showing how Q adapts to sudden workload shifts.
+* Key Deliverables (Second Half): * Presentation: Draft slides focusing on the motivation (why static Q fails) and the results (how AIMD rescues starved requests). Practice timing.
+   * Report: Write the final MLSys-formatted paper. Focus heavily on the "Evaluation" and "Methodology" sections, detailing why your controller reacted the way it did.
+
+
+[a]https://discuss.vllm.ai/t/why-vllm-does-not-support-lmp/1763/2
+[b]Existing schedulers for serving face a starvation issue as the LPM policy uses a greedy approach that only makes decisions purely based on prefix cache score
+-> LPM maximizes locality and throughput but enables a dominant or malicious client with long shared prefixes to monopolize the GPU, starving other clients
+Some requests might not be scheduled for a long time (for ex new requests) if their context aren’t in the prefix cache 
+With the rise of multi-turn agentic workflows and massive system prompts, the penalty for a prefix cache miss and the resulting starvation is much more severe now. 
+In a multi-tenant LLM serving system, starvation disproportionately affects clients whose requests have little or no overlap with what is currently cached in the prefix tree — most notably, a brand-new client sending their first request, or any client switching to a new topic. Because LPM greedily schedules requests with the longest matching prefix, these "cold" requests are perpetually deprioritized whenever a dominant client is flooding the system with requests that share a long common prefix.
+Why fairness matters: This is particularly problematic in shared API settings, where multiple users or organizations are concurrent clients on the same infrastructure. Each client expects predictable, isolated performance — their latency should not degrade simply because another client happens to have a cache-friendly workload or behaves maliciously by sending large volumes of prefix-heavy requests to monopolize the GPU.
+[c]Why fairness matters: This is particularly problematic in shared API settings, where multiple users or organizations are concurrent clients on the same infrastructure. Each client expects predictable, isolated performance — their latency should not degrade simply because another client happens to have a cache-friendly workload or behaves maliciously by sending large volumes of prefix-heavy requests to monopolize the GPU.
+[d]old: How can we implement a hybrid scheduler policy that balances prefix awareness with fairness
+Can we design lightweight, low-overhead variants of DLPM or alternative mechanisms, such as aging-based fairness or locality-aware rescue that approximate fairness without requiring full deficit tracking?
+[e]old:  Can we come up with simpler, lightweight scheduling policies that achieve similar fairness-efficiency tradeoffs?
