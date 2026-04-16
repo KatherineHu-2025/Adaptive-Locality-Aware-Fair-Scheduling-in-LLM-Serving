@@ -21,6 +21,7 @@ data/
 results/
 *.csv
 *.jsonl
+*.json
 *.parquet
 
 # Figures (generated outputs)
@@ -48,3 +49,4 @@ figures/
 !docs/
 !docs/plots/
 !docs/plots/*.png
+!docs/plots/**/*.png
