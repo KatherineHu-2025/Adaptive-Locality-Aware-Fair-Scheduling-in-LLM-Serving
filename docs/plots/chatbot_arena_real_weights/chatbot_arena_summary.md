@@ -13,19 +13,21 @@
 
 ### Overall TTFT
 
-| Policy         | P50 (ms) | P95 (ms) | P99 (ms) | Throughput (tok/s) |
-|----------------|----------:|---------:|---------:|-------------------:|
-| Adaptive DLPM  |       252 |    2,232 |   18,614 |               37.1 |
-| LPM            |       514 |   35,591 |   35,591 |               37.1 |
-| FCFS           |       236 |   14,997 |   14,997 |               37.1 |
+| Policy                | P50 (ms) | P95 (ms) | P99 (ms) | Throughput (tok/s) |
+|-----------------------|---------:|---------:|---------:|-------------------:|
+| Adaptive DLPM         |      252 |    2,232 |   18,614 |               37.1 |
+| DLPM (static Q=4000)  |    1,320 |   23,555 |   23,555 |               37.1 |
+| LPM                   |      514 |   35,591 |   35,591 |               37.1 |
+| FCFS                  |      236 |   14,997 |   14,997 |               37.1 |
 
 ### TTFT by Turn
 
-| Policy        | Turn 1 P50 | Turn 1 P99 | Turn 2 P50 | Turn 2 P99 | Turn 3+ P50 | Turn 3+ P99 |
-|---------------|-----------:|-----------:|-----------:|-----------:|------------:|------------:|
-| Adaptive DLPM |       339ms |    20,441ms |       244ms |    1,980ms |        211ms |    1,068ms |
-| LPM           |       569ms |    37,926ms |       554ms |    1,547ms |        289ms |      701ms |
-| FCFS          |       340ms |    16,512ms |       219ms |      743ms |        186ms |      500ms |
+| Policy               | Turn 1 P50 | Turn 1 P99 | Turn 2 P50 | Turn 2 P99 | Turn 3+ P50 | Turn 3+ P99 |
+|----------------------|-----------:|-----------:|-----------:|-----------:|------------:|------------:|
+| Adaptive DLPM        |       339ms |    20,441ms |       244ms |    1,980ms |        211ms |    1,068ms |
+| DLPM (static Q=4000) |     1,365ms |    26,244ms |     1,361ms |    2,125ms |      1,068ms |    2,085ms |
+| LPM                  |       569ms |    37,926ms |       554ms |    1,547ms |        289ms |      701ms |
+| FCFS                 |       340ms |    16,512ms |       219ms |      743ms |        186ms |      500ms |
 
 ---
 
@@ -42,11 +44,21 @@ The starvation also cascades into turn-2 P50: LPM's warm-turn median is 554ms
 vs ~230ms for the other two policies, because the backlog of starved cold requests
 eventually blocks even cached requests.
 
-### 2. Adaptive DLPM halves LPM's starvation tail
+### 2. Static DLPM trades median for a worse starvation tail
 
-The DLPM deficit counter ensures cold clients are served before their deficit
-grows unbounded. Turn-1 P99 drops from 37,926ms (LPM) to 20,441ms (Adaptive
-DLPM) — a **46% reduction**.
+DLPM with static Q=4000 has the worst P50 of all policies (1,365ms turn-1 vs
+~340ms for Adaptive DLPM and FCFS). The fixed quantum causes all clients to
+wait through a full refill cycle before being served, hurting median latency.
+Its starvation tail (P99=26,244ms) is better than LPM but worse than Adaptive
+DLPM — without the AIMD controller to tighten Q under load, the static budget
+is either too large (wasting fairness) or too small (causing long wait cycles).
+
+### 3. Adaptive DLPM halves LPM's starvation tail
+
+The AIMD controller dynamically adjusts Q, allowing Adaptive DLPM to prevent
+runaway starvation without penalising median latency. Turn-1 P99 drops from
+37,926ms (LPM) to 20,441ms (Adaptive DLPM) — a **46% reduction** — while
+keeping P50 near FCFS levels (339ms vs 340ms).
 
 ### 3. FCFS wins overall P99 at this load level
 
