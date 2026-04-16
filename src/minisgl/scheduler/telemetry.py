@@ -8,10 +8,12 @@ the AIMD controller to dynamically adjust the DLPM quantum Q.
 
 from __future__ import annotations
 
+import csv
 import json
+import os
 import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 
@@ -170,3 +172,63 @@ class AIMDController:
 
     def get_Q(self) -> float:
         return self.current_Q
+
+
+# ---------------------------------------------------------------------------
+# File-based request and Q-trajectory logger
+# ---------------------------------------------------------------------------
+
+class RequestLogger:
+    """
+    Writes per-request metrics to a JSONL file and Q trajectory to a CSV.
+
+    Activated by setting the MINISGL_LOG_DIR environment variable.
+    Creates:
+      {log_dir}/requests_{policy}_{timestamp}.jsonl  — one line per request
+      {log_dir}/q_trajectory_{timestamp}.csv         — Q history (adaptive_dlpm)
+    """
+
+    def __init__(self, log_dir: str, policy: str) -> None:
+        os.makedirs(log_dir, exist_ok=True)
+        ts = int(time.time())
+        self._policy = policy
+        req_path = os.path.join(log_dir, f"requests_{policy}_{ts}.jsonl")
+        self._req_file = open(req_path, "w", buffering=1)  # line-buffered
+        self._q_path = os.path.join(log_dir, f"q_trajectory_{ts}.csv")
+
+    def log_request(
+        self,
+        req_id: int,
+        client_id: str,
+        arrival_time: float,
+        ttft_ms: float,
+        tpot_ms: float,
+        prompt_len: int,
+        cached_len: int,
+        q_at_scheduling: float,
+    ) -> None:
+        record = {
+            "req_id": req_id,
+            "client_id": client_id,
+            "arrival_time": arrival_time,
+            "ttft_ms": round(ttft_ms, 3),
+            "tpot_ms": round(tpot_ms, 3),
+            "prompt_len": prompt_len,
+            "cached_len": cached_len,
+            "cache_hit_rate": round(cached_len / prompt_len, 4) if prompt_len > 0 else 0.0,
+            "policy": self._policy,
+            "Q_at_scheduling": q_at_scheduling,
+        }
+        self._req_file.write(json.dumps(record) + "\n")
+
+    def flush_q_history(self, history: List[Tuple[float, float, float, float]]) -> None:
+        """Write Q trajectory to CSV. history entries: (wall_time, Q, jain, p99_ttft_ms)."""
+        if not history:
+            return
+        with open(self._q_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["wall_time", "Q", "jain_index", "p99_ttft_ms"])
+            writer.writerows(history)
+
+    def close(self) -> None:
+        self._req_file.close()

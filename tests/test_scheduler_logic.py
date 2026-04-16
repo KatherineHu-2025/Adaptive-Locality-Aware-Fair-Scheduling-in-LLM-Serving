@@ -178,36 +178,49 @@ class TestDLPMPolicy:
 
     def test_ineligible_client_pushed_to_back(self):
         """
-        Client A deficit=5000 (dominant), client B deficit=0.
-        With Q=1000, A is ineligible → B goes first regardless of cache score.
+        Client A has exhausted its budget (q<=0); client B still has quota (q>0).
+        B should be scheduled first even though A has a hotter cache.
         """
         reqs = [make_pending_req(0, "A", 100), make_pending_req(1, "B", 100)]
         cm = make_cache_manager({0: 90, 1: 0})  # A has more cache
         ds = DeficitState()
-        ds.deficit["A"] = 5000.0
-        ds.deficit["B"] = 0.0
+        # A exhausted, B still has budget — B has q>0 so CHECKREFILL does NOT fire
+        ds.q["A"] = 0.0    # not > 0, ineligible
+        ds.q["B"] = 500.0  # eligible
         result = reorder_pending_list(reqs, cm, policy="dlpm", deficit_state=ds, Q=1000)
         assert result[0].uid == 1  # B is eligible despite cold cache
 
-    def test_no_eligible_falls_back_to_min_deficit(self):
-        """If Q=0, only the exact minimum-deficit client is eligible."""
+    def test_checkrefill_fires_when_all_exhausted(self):
+        """
+        When all active clients have q<=0, CHECKREFILL replenishes every
+        exhausted client by Q so the next round can proceed (paper lines 3-8).
+        """
         reqs = [make_pending_req(0, "A", 100), make_pending_req(1, "B", 100)]
         cm = make_cache_manager({0: 90, 1: 10})
         ds = DeficitState()
-        ds.deficit["A"] = 100.0
-        ds.deficit["B"] = 0.0
-        result = reorder_pending_list(reqs, cm, policy="dlpm", deficit_state=ds, Q=0)
-        # min deficit is B (0) → B goes first
-        assert result[0].uid == 1
+        ds.q["A"] = -50.0   # exhausted
+        ds.q["B"] = -100.0  # exhausted
+        result = reorder_pending_list(reqs, cm, policy="dlpm", deficit_state=ds, Q=200)
+        # After refill: A.q = 150, B.q = 100 — both eligible, LPM picks A (cache=90)
+        assert result[0].uid == 0
+        assert ds.q["A"] == pytest.approx(150.0)
+        assert ds.q["B"] == pytest.approx(100.0)
 
-    def test_deficit_update_marks_served_as_zero(self):
-        reqs = [make_pending_req(0, "A", 100), make_pending_req(1, "B", 100)]
+    def test_deduct_prefill_reduces_budget(self):
+        """deduct_prefill subtracts w_e * extend_len from q_i (paper line 23)."""
         ds = DeficitState()
-        ds.deficit["A"] = 200.0
-        ds.deficit["B"] = 0.0
-        ds.update(reqs, served_client_ids={"A"})
-        assert ds.deficit["A"] == 0.0
-        assert ds.deficit["B"] == 100.0  # B was skipped, accumulates input_len
+        ds.register("A")
+        ds.q["A"] = 500.0
+        ds.deduct_prefill("A", 100)   # w_e=1, so deduct 100
+        assert ds.q["A"] == pytest.approx(400.0)
+
+    def test_deduct_decode_reduces_budget(self):
+        """deduct_decode subtracts w_q * output_tokens from q_i (paper line 26)."""
+        ds = DeficitState()
+        ds.register("A")
+        ds.q["A"] = 500.0
+        ds.deduct_decode("A", 1)   # w_q=2, so deduct 2
+        assert ds.q["A"] == pytest.approx(498.0)
 
     def test_requires_deficit_state(self):
         reqs = [make_pending_req(0, "c", 100)]
@@ -236,27 +249,24 @@ class TestStarvationScenario:
             assert ordered[-1].uid == 100 or all(r.uid != 100 for r in ordered[:-1])
 
     def test_dlpm_prevents_starvation(self):
-        """After enough rounds, B's accumulated deficit forces it to the front."""
+        """
+        Client B still has remaining budget (q>0) while A has exhausted its
+        quota (q<=0).  B is served first despite A having a hotter cache,
+        matching the paper's fairness guarantee (Algorithm 1, line 21).
+        """
         ds = DeficitState()
         A_req = make_pending_req(0, "A", 100)
         B_req = make_pending_req(1, "B", 100)
         queue = [A_req, B_req]
 
-        cm = make_cache_manager({0: 90, 1: 0})
-        Q = 150  # tight bound
+        cm = make_cache_manager({0: 90, 1: 0})  # A has hot cache
 
-        # Set deficits directly: A has been served (deficit=0),
-        # B has been skipped 3 times (deficit = 3 * 100 = 300).
-        # With Q=150: eligible = {c : deficit[c] <= min_deficit + Q}
-        #             = {c : deficit[c] <= 0 + 150}  → only A (0 <= 150)
-        # Wait — that means A is eligible, not B.
-        # For B to go first we need B's deficit to be the MINIMUM so A is the
-        # one outside the eligible window. Flip: B=0, A=300.
-        ds.deficit["A"] = 300.0
-        ds.deficit["B"] = 0.0
+        # Simulate one full cycle: A was heavily served (exhausted), B was not
+        ds.q["A"] = 0.0    # exhausted — not eligible (0 is not > 0)
+        ds.q["B"] = 200.0  # still has quota — eligible
 
-        ordered = reorder_pending_list(queue, cm, policy="dlpm", deficit_state=ds, Q=Q)
-        # min_deficit = 0 (B). A's deficit (300) > 0 + 150 → A ineligible.
+        ordered = reorder_pending_list(queue, cm, policy="dlpm", deficit_state=ds, Q=1000)
+        # B has q>0 so CHECKREFILL does NOT fire; A stays ineligible.
         # Eligible = [B] → B goes first despite cold cache.
         assert ordered[0].uid == 1  # B gets scheduled first
 
