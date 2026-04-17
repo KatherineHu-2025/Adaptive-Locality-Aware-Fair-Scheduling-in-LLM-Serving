@@ -54,6 +54,7 @@ import argparse
 import json
 import math
 import os
+import shutil
 import statistics as st
 import subprocess
 import sys
@@ -61,6 +62,47 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib import request
+
+
+def _find_modal_python() -> str:
+    """
+    Return the Python executable that has `modal` installed.
+
+    `modal` is often installed under a system Python that is different from
+    the one running this script (e.g. miniconda vs. /usr/local).  We try:
+      1. The current interpreter (fast path — works when modal is in the same venv).
+      2. The Python living next to the `modal` binary on PATH.
+      3. The current interpreter as a fallback (let the error surface naturally).
+    """
+    # Fast path: current interpreter already has modal
+    try:
+        subprocess.run(
+            [sys.executable, "-c", "import modal"],
+            check=True, capture_output=True,
+        )
+        return sys.executable
+    except subprocess.CalledProcessError:
+        pass
+
+    modal_bin = shutil.which("modal")
+    if modal_bin:
+        bin_dir = Path(modal_bin).parent
+        for name in ("python3", "python"):
+            candidate = bin_dir / name
+            if candidate.exists():
+                try:
+                    subprocess.run(
+                        [str(candidate), "-c", "import modal"],
+                        check=True, capture_output=True,
+                    )
+                    return str(candidate)
+                except subprocess.CalledProcessError:
+                    pass
+
+    return sys.executable  # best-effort fallback
+
+
+MODAL_PYTHON = _find_modal_python()
 
 
 def run_cmd(cmd: list[str], env: dict[str, str] | None = None, allow_fail: bool = False) -> int:
@@ -76,6 +118,14 @@ def fetch_json(url: str, timeout: float = 30.0) -> dict[str, Any]:
     with request.urlopen(req, timeout=timeout) as resp:
         payload = resp.read().decode("utf-8", errors="replace")
     return json.loads(payload)
+
+
+def post_json(url: str, payload: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    req = request.Request(url, data=body, method="POST", headers={"Content-Type": "application/json"})
+    with request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read().decode("utf-8", errors="replace")
+    return json.loads(data)
 
 
 def wait_for_health(base_url: str, startup_timeout: float, poll_interval: float, request_timeout: float) -> dict[str, Any]:
@@ -98,6 +148,12 @@ def wait_for_health(base_url: str, startup_timeout: float, poll_interval: float,
     raise TimeoutError(
         f"Timed out waiting for health at {url} after {startup_timeout:.0f}s. Last error: {last_err}"
     )
+
+
+def reset_experiment_state(base_url: str, request_timeout: float) -> dict[str, Any]:
+    """Reset AIMD/telemetry state after warmup without restarting the service."""
+    url = f"{base_url.rstrip('/')}/reset_experiment"
+    return post_json(url, {"scope": "experiment"}, timeout=request_timeout)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -214,6 +270,19 @@ def _extract_phase_summaries(case: dict[str, Any]) -> tuple[dict[str, Any], dict
     return phase_a.get("summary", {}) if isinstance(phase_a, dict) else {}, phase_b.get("summary", {}) if isinstance(phase_b, dict) else {}
 
 
+def _shade_two_phases(ax, x_split: float, x_min: float, x_max: float) -> None:
+    """Add light Phase A / Phase B background shading and a boundary line to ax."""
+    span = max(x_max - x_min, 1e-9)
+    ax.axvspan(x_min, x_split, alpha=0.07, color="tab:blue", zorder=0)
+    ax.axvspan(x_split, x_max, alpha=0.07, color="tab:orange", zorder=0)
+    ax.axvline(x_split, color="gray", linestyle="--", alpha=0.45, linewidth=1.2, zorder=1)
+    frac = (x_split - x_min) / span
+    ax.text(frac / 2, 0.97, "Phase A", transform=ax.transAxes,
+            fontsize=7.5, ha="center", va="top", color="tab:blue", alpha=0.75)
+    ax.text((1 + frac) / 2, 0.97, "Phase B", transform=ax.transAxes,
+            fontsize=7.5, ha="center", va="top", color="tab:orange", alpha=0.75)
+
+
 def plot_case_figure(case: dict[str, Any], output_dir: Path, dpi: int) -> Path | None:
     try:
         import matplotlib
@@ -227,6 +296,22 @@ def plot_case_figure(case: dict[str, Any], output_dir: Path, dpi: int) -> Path |
     label = str(case["label"])
     rows = read_jsonl(Path(case["jsonl"]))
     aimd_records = read_aimd_records(Path(case["aimd_run"]))
+
+    # Two-phase shading: detect phase boundary from the merged AIMD JSON
+    _raw_payload: dict = {}
+    try:
+        _raw_payload = json.loads(Path(case["aimd_run"]).read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    _phase_split_aimd_idx: int | None = None  # index in aimd_records where phase B starts
+    _n_phase_a_ok: int | None = None           # successful requests in phase A
+    if _raw_payload.get("mode") == "two-phase":
+        _n_pa = len((_raw_payload.get("phase_a") or {}).get("records") or [])
+        if 0 < _n_pa < len(aimd_records):
+            _phase_split_aimd_idx = _n_pa
+        _pa_jsonl = Path(case["jsonl"]).parent / Path(case["jsonl"]).name.replace("jain_v2.jsonl", "phase_a_v2.jsonl")
+        if _pa_jsonl.exists():
+            _n_phase_a_ok = sum(1 for r in read_jsonl(_pa_jsonl) if r.get("success"))
 
     fig, axes = plt.subplots(3, 2, figsize=(15, 13), dpi=dpi)
     ax_q, ax_aimd, ax_q_ttft, ax_ttft, ax_thr, ax_ttft_hist = axes.ravel()
@@ -243,6 +328,11 @@ def plot_case_figure(case: dict[str, Any], output_dir: Path, dpi: int) -> Path |
             x_vals = [0.0 if math.isnan(v) else (v - t0) for v in t_vals]
             ax_q.set_xlabel("Time Since First AIMD Update (s)")
             ax_aimd.set_xlabel("Time Since First AIMD Update (s)")
+
+        # Phase boundary in x-axis units (midpoint between last phase-A and first phase-B point)
+        _phase_split_x: float | None = None
+        if _phase_split_aimd_idx is not None and _phase_split_aimd_idx < len(x_vals):
+            _phase_split_x = (x_vals[_phase_split_aimd_idx - 1] + x_vals[_phase_split_aimd_idx]) / 2
 
         ax_q.plot(x_vals, q_vals, color="tab:blue", linewidth=2, label="Q")
         violated_x = [x_vals[i] for i, r in enumerate(aimd_records) if bool(r.get("violated"))]
@@ -266,10 +356,23 @@ def plot_case_figure(case: dict[str, Any], output_dir: Path, dpi: int) -> Path |
             fontsize=9,
             bbox={"facecolor": "white", "alpha": 0.7, "edgecolor": "none"},
         )
+        if _phase_split_x is not None and x_vals:
+            _shade_two_phases(ax_q, _phase_split_x, x_vals[0], x_vals[-1])
 
-        jain_vals = [_safe_float(r.get("jain")) for r in aimd_records]
+        jain_vals = [_safe_float(r.get("jain_control", r.get("jain"))) for r in aimd_records]
+        jain_prompt_vals = [_safe_float(r.get("jain_prompt")) for r in aimd_records]
         p99_vals = [_safe_float(r.get("p99_ttft_ms")) for r in aimd_records]
-        ln1 = ax_aimd.plot(x_vals, jain_vals, color="tab:green", linewidth=2, label="AIMD Jain")
+        max_wait_vals = [_safe_float(r.get("max_wait_ms")) for r in aimd_records]
+        ln1 = ax_aimd.plot(x_vals, jain_vals, color="tab:green", linewidth=2, label="AIMD Jain (control)")
+        if any(not math.isnan(v) for v in jain_prompt_vals):
+            ln1 += ax_aimd.plot(
+                x_vals,
+                jain_prompt_vals,
+                color="tab:olive",
+                linewidth=1.5,
+                linestyle="--",
+                label="AIMD Jain (prompt)",
+            )
         try:
             threshold = float(case["jain_threshold"])
             ax_aimd.axhline(threshold, color="tab:green", linestyle="--", alpha=0.6, label="Jain Threshold")
@@ -287,10 +390,21 @@ def plot_case_figure(case: dict[str, Any], output_dir: Path, dpi: int) -> Path |
             linewidth=1.8,
             label="AIMD p99_ttft_ms",
         )
+        if any(not math.isnan(v) for v in max_wait_vals):
+            ln2 += ax_aimd_right.plot(
+                x_vals,
+                max_wait_vals,
+                color="tab:red",
+                linewidth=1.4,
+                linestyle=":",
+                label="AIMD max_wait_ms",
+            )
         ax_aimd_right.set_ylabel("AIMD p99_ttft_ms")
         lines = ln1 + ln2
         labels = [ln.get_label() for ln in lines]
         ax_aimd.legend(lines, labels, loc="best")
+        if _phase_split_x is not None and x_vals:
+            _shade_two_phases(ax_aimd, _phase_split_x, x_vals[0], x_vals[-1])
 
         scatter_points: list[tuple[float, float, bool]] = []
         for i, q in enumerate(q_vals):
@@ -342,6 +456,8 @@ def plot_case_figure(case: dict[str, Any], output_dir: Path, dpi: int) -> Path |
         ax_ttft.set_ylabel("TTFT (ms)")
         ax_ttft.grid(True, alpha=0.3)
         ax_ttft.legend(loc="best")
+        if _n_phase_a_ok is not None and _n_phase_a_ok > 0:
+            _shade_two_phases(ax_ttft, _n_phase_a_ok + 0.5, 1, len(ttft_vals))
     else:
         ax_ttft.set_title(f"{label.upper()} TTFT")
         ax_ttft.text(0.5, 0.5, "No TTFT samples", ha="center", va="center")
@@ -375,6 +491,8 @@ def plot_case_figure(case: dict[str, Any], output_dir: Path, dpi: int) -> Path |
         ax_thr.set_ylabel("Tokens/sec")
         ax_thr.grid(True, alpha=0.3)
         ax_thr.legend(loc="best")
+        if _n_phase_a_ok is not None and _n_phase_a_ok > 0:
+            _shade_two_phases(ax_thr, _n_phase_a_ok + 0.5, 1, len(ok_rows))
     else:
         ax_thr.set_title(f"{label.upper()} Throughput Trend")
         ax_thr.text(0.5, 0.5, "No throughput samples", ha="center", va="center")
@@ -508,6 +626,10 @@ def run_warmup(label: str, args: argparse.Namespace) -> Path:
         str(args.warmup_dominant_reqs),
         "--cold-reqs",
         str(args.warmup_cold_reqs),
+        "--num-dominant-clients",
+        str(args.num_dominant_clients),
+        "--num-cold-clients",
+        str(args.num_cold_clients),
         "--seed",
         str(args.seed),
         "--output",
@@ -542,6 +664,10 @@ def run_probe(
         str(dominant_reqs),
         "--cold-reqs",
         str(cold_reqs),
+        "--num-dominant-clients",
+        str(args.num_dominant_clients),
+        "--num-cold-clients",
+        str(args.num_cold_clients),
         "--arrival-mode",
         args.arrival_mode,
         "--max-concurrency",
@@ -570,10 +696,10 @@ def run_case(
     env = base_env.copy()
     env["AIMD_JAIN_THRESHOLD"] = jain_threshold
 
-    run_cmd([sys.executable, "-m", "modal", "app", "stop", args.app_name], allow_fail=True)
+    run_cmd([MODAL_PYTHON, "-m", "modal", "app", "stop", args.app_name], allow_fail=True)
 
     run_cmd(
-        [sys.executable, "-m", "modal", "deploy", "run_modal_service.py", "--name", args.app_name],
+        [MODAL_PYTHON, "-m", "modal", "deploy", "run_modal_service.py", "--name", args.app_name],
         env=env,
     )
 
@@ -594,6 +720,12 @@ def run_case(
         )
         warmup_out = run_warmup(label=label, args=args)
         print("[warmup] output:", warmup_out)
+        if args.enable_reset_after_warmup:
+            reset_payload = reset_experiment_state(
+                base_url=args.server,
+                request_timeout=max(30.0, args.health_request_timeout),
+            )
+            print("[warmup] reset experiment state:", reset_payload)
 
     out_jsonl = args.output_dir / f"probe_{label}_jain_v2.jsonl"
     out_aimd_run = args.output_dir / f"probe_{label}_jain_v2_aimd_run.json"
@@ -744,8 +876,8 @@ def main() -> int:
         help="Per-request timeout (seconds) for health checks.",
     )
 
-    parser.add_argument("--strict-jain-threshold", default="0.95")
-    parser.add_argument("--relaxed-jain-threshold", default="0.50")
+    parser.add_argument("--strict-jain-threshold", default="0.80")
+    parser.add_argument("--relaxed-jain-threshold", default="0.70")
 
     parser.add_argument(
         "--disable-two-phase-sawtooth",
@@ -760,11 +892,20 @@ def main() -> int:
     parser.add_argument("--phase-b-k", type=float, default=0.5)
     parser.add_argument("--phase-b-dominant-reqs", type=int, default=60)
     parser.add_argument("--phase-b-cold-reqs", type=int, default=40)
+    parser.add_argument("--num-dominant-clients", type=int, default=1,
+                        help="Number of distinct dominant client IDs sharing the same system prompt")
+    parser.add_argument("--num-cold-clients", type=int, default=1,
+                        help="Number of distinct cold client IDs with unique prompts")
 
     parser.add_argument(
         "--disable-warmup",
         action="store_true",
         help="Disable pre-probe warmup load.",
+    )
+    parser.add_argument(
+        "--disable-reset-after-warmup",
+        action="store_true",
+        help="Keep AIMD/telemetry state from warmup instead of resetting before the measured probe.",
     )
     parser.add_argument("--warmup-dominant-reqs", type=int, default=2)
     parser.add_argument("--warmup-cold-reqs", type=int, default=2)
@@ -799,11 +940,12 @@ def main() -> int:
     parser.add_argument("--additive-step", default="250")
     parser.add_argument("--mult-factor", default="0.7")
     parser.add_argument("--ttft-slo-ms", default="900")
-    parser.add_argument("--telemetry-window", default="60")
+    parser.add_argument("--telemetry-window", default="30")
     parser.add_argument("--aimd-debug-log-path", default="/tmp/minisgl_aimd_history.jsonl")
 
     args = parser.parse_args()
     args.enable_warmup = not args.disable_warmup
+    args.enable_reset_after_warmup = not args.disable_reset_after_warmup
     args.enable_two_phase_sawtooth = not args.disable_two_phase_sawtooth
     args.enable_plots = not args.disable_plots
     args.output_dir = Path(args.output_dir)

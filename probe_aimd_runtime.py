@@ -99,6 +99,8 @@ def main() -> int:
     parser.add_argument("--k", type=float, default=0.5)
     parser.add_argument("--dominant-reqs", type=int, default=30)
     parser.add_argument("--cold-reqs", type=int, default=20)
+    parser.add_argument("--num-dominant-clients", type=int, default=1)
+    parser.add_argument("--num-cold-clients", type=int, default=1)
     parser.add_argument("--arrival-mode", choices=["global", "per-client"], default="per-client")
     parser.add_argument("--max-concurrency", type=int, default=4)
     parser.add_argument("--timeout", type=float, default=600.0)
@@ -151,6 +153,10 @@ def main() -> int:
         str(args.dominant_reqs),
         "--cold-reqs",
         str(args.cold_reqs),
+        "--num-dominant-clients",
+        str(args.num_dominant_clients),
+        "--num-cold-clients",
+        str(args.num_cold_clients),
         "--seed",
         str(args.seed),
         "--output",
