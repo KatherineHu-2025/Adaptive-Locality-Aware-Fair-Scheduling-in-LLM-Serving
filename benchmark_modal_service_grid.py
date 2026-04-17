@@ -192,18 +192,19 @@ def summarize_jsonl(
     total_wall = max((float(r.get("arrival_time", 0.0)) for r in rows), default=0.0)
     total_tokens = sum(int(r.get("output_tokens", 0)) for r in success)
 
-    # Jain Fairness Index — paper uses service tokens per client:
-    #   service_tokens = extend_tokens × 1 + output_tokens × 2
-    # where extend_tokens = tokens served from prefix cache (cached_len).
-    # If cached_len is missing (-1), fall back to output_tokens × 2 only.
+    # Jain Fairness Index — paper formula (§3, following VTC):
+    #   service_i = extend_tokens × 1 + output_tokens × 2
+    # extend_tokens = prompt_len - cached_len (cached tokens cost nothing to recompute).
+    # cached_len is -1 when the server did not return it; fall back to prompt_len in that case.
     by_client_service: dict[str, int] = {}
     by_client_output: dict[str, int] = {}
     for r in success:
         cid = str(r.get("client_id", ""))
         out_tok = int(r.get("output_tokens", 0))
-        cached = int(r.get("cached_len", -1))
-        extend_tok = max(0, cached)  # 0 when unknown
-        service_tok = out_tok * 2 + extend_tok
+        prompt_tok = int(r.get("prompt_len", 0))
+        cached_tok = int(r.get("cached_len", -1))
+        extend_tok = max(prompt_tok - cached_tok, 0) if cached_tok >= 0 else prompt_tok
+        service_tok = extend_tok + out_tok * 2
         by_client_service[cid] = by_client_service.get(cid, 0) + service_tok
         by_client_output[cid] = by_client_output.get(cid, 0) + out_tok
 
@@ -214,6 +215,50 @@ def summarize_jsonl(
 
     jain = _jain(list(by_client_service.values()))
     jain_output = _jain(list(by_client_output.values()))
+
+    # Active-window metrics — paper convention: measure throughput and Jain
+    # only during the interval when ALL clients are simultaneously active.
+    #   t_start = max(each client's earliest arrival_time)
+    #   t_end   = min(each client's latest completion_time)
+    # completion_time = arrival_time + ttft_ms / 1000
+    by_client_arrivals: dict[str, list[float]] = {}
+    by_client_completions: dict[str, list[float]] = {}
+    for r in success:
+        cid = str(r.get("client_id", ""))
+        arr = float(r.get("arrival_time", 0.0))
+        ttft_s = float(r.get("ttft_ms", 0.0)) / 1000.0
+        by_client_arrivals.setdefault(cid, []).append(arr)
+        by_client_completions.setdefault(cid, []).append(arr + ttft_s)
+
+    n_clients = len(by_client_arrivals)
+    if n_clients >= 2:
+        t_start = max(min(v) for v in by_client_arrivals.values())
+        t_end = min(max(v) for v in by_client_completions.values())
+        active_dur = max(t_end - t_start, 1e-9)
+
+        active_service: dict[str, int] = {}
+        active_output: dict[str, int] = {}
+        active_tokens = 0
+        for r in success:
+            arr = float(r.get("arrival_time", 0.0))
+            ttft_s = float(r.get("ttft_ms", 0.0)) / 1000.0
+            if t_start <= arr and arr + ttft_s <= t_end:
+                cid = str(r.get("client_id", ""))
+                out_tok = int(r.get("output_tokens", 0))
+                prompt_tok = int(r.get("prompt_len", 0))
+                cached_tok = int(r.get("cached_len", -1))
+                extend_tok = max(prompt_tok - cached_tok, 0) if cached_tok >= 0 else prompt_tok
+                active_tokens += out_tok
+                active_service[cid] = active_service.get(cid, 0) + extend_tok + out_tok * 2
+                active_output[cid] = active_output.get(cid, 0) + out_tok
+
+        throughput_active = active_tokens / active_dur
+        jain_active = _jain(list(active_service.values()))
+        jain_active_output = _jain(list(active_output.values()))
+    else:
+        throughput_active = float("nan")
+        jain_active = float("nan")
+        jain_active_output = float("nan")
 
     return {
         "policy": policy,
@@ -228,12 +273,15 @@ def summarize_jsonl(
         "failed_count": len(failed),
         "success_rate": (len(success) / len(rows)) if rows else 0.0,
         "throughput_tok_per_sec": total_tokens / max(total_wall, 1e-9),
+        "throughput_active_tok_per_sec": throughput_active,   # active-window only
         "ttft_p50_ms": percentile(ttfts, 0.50),
         "ttft_p95_ms": percentile(ttfts, 0.95),
         "ttft_p99_ms": percentile(ttfts, 0.99),
         "ttft_mean_ms": statistics.fmean(ttfts) if ttfts else float("nan"),
-        "jain_index": jain,           # paper metric: service tokens (extend×1 + output×2)
-        "jain_output_tokens": jain_output,  # simpler metric: raw output tokens only
+        "jain_index": jain,                   # paper metric, all requests
+        "jain_index_active": jain_active,     # paper metric, active window only
+        "jain_output_tokens": jain_output,    # output-only, all requests
+        "jain_output_active": jain_active_output,  # output-only, active window
         "run_error": "",
         "output_file": str(path),
     }
@@ -264,12 +312,15 @@ def make_failed_row(
         "failed_count": 0,
         "success_rate": 0.0,
         "throughput_tok_per_sec": float("nan"),
+        "throughput_active_tok_per_sec": float("nan"),
         "ttft_p50_ms": float("nan"),
         "ttft_p95_ms": float("nan"),
         "ttft_p99_ms": float("nan"),
         "ttft_mean_ms": float("nan"),
         "jain_index": float("nan"),
+        "jain_index_active": float("nan"),
         "jain_output_tokens": float("nan"),
+        "jain_output_active": float("nan"),
         "run_error": run_error,
         "output_file": str(output_file),
     }
@@ -382,7 +433,7 @@ def main() -> int:
         ),
     )
     parser.add_argument("--cold-fraction", type=float, default=0.2)
-    parser.add_argument("--arrival-mode", choices=["global", "per-client"], default="per-client")
+    parser.add_argument("--arrival-mode", choices=["global", "per-client", "sequential"], default="per-client")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--max-concurrency", type=int, default=2)
     parser.add_argument("--seed", type=int, default=42)

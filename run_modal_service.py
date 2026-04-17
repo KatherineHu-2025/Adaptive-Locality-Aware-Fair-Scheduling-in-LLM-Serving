@@ -124,6 +124,9 @@ def hosted_minisgl_app():
         client_id: str = ""
         ignore_eos: bool = False
 
+    class ResetPayload(BaseModel):
+        scope: str = "experiment"
+
     policy = os.getenv("MODAL_MINISGL_POLICY", "adaptive_dlpm")
     model_path = os.getenv("MODAL_MINISGL_MODEL", MODEL_NAME)
     use_dummy = os.getenv("MODAL_MINISGL_DUMMY_WEIGHT", "1") not in {"0", "false", "False"}
@@ -212,6 +215,41 @@ def hosted_minisgl_app():
             return {"ok": True, "policy": policy, "count": len(lines), "records": records}
         except Exception as exc:
             return {"ok": False, "error": str(exc)[:200]}
+
+    @app_web.post("/reset_experiment")
+    def reset_experiment(req: ResetPayload) -> dict:
+        try:
+            upstream = req_lib.post(
+                "http://127.0.0.1:19190/reset_experiment",
+                json={"scope": req.scope},
+                timeout=(10, 30),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"upstream error: {exc}")
+
+        if upstream.status_code != 200:
+            body = upstream.text[:300]
+            raise HTTPException(status_code=upstream.status_code, detail=body)
+
+        # Best-effort wait for the scheduler to process the reset and truncate
+        # the AIMD debug log before the measured probe starts.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                p = Path(aimd_log_path)
+                lines = [ln for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines() if ln.strip()] if p.exists() else []
+                if not lines:
+                    break
+            except Exception:
+                break
+            time.sleep(0.2)
+
+        try:
+            payload = upstream.json()
+        except Exception:
+            payload = {"ok": True, "scope": req.scope}
+        payload["aimd_log_path"] = aimd_log_path
+        return payload
 
     @app_web.post("/generate")
     def generate(req: GeneratePayload):
