@@ -81,6 +81,10 @@ class DeficitState:
         """A client may be scheduled when q_i > 0 (paper line 21)."""
         return self.q[client_id] > 0
 
+    def reset(self) -> None:
+        """Reset all per-client DLPM deficit state between experiment phases."""
+        self.q.clear()
+
 
 # ---------------------------------------------------------------------------
 # Scoring helpers

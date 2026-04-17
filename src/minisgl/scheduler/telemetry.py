@@ -14,7 +14,7 @@ import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List
 
 
 # ---------------------------------------------------------------------------
@@ -28,6 +28,7 @@ class CompletedReqRecord:
     ttft: float           # seconds from arrival to first output token
     prompt_len: int       # total input tokens
     cached_len: int       # tokens matched in radix cache at scheduling time
+    output_tokens: int = 0  # output tokens produced (for paper Jain formula)
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,10 @@ class SlidingWindowTelemetry:
     def record(self, rec: CompletedReqRecord) -> None:
         self.window.append(rec)
 
+    def reset(self) -> None:
+        """Clear the rolling telemetry window between warmup and measured runs."""
+        self.window.clear()
+
     # ------------------------------------------------------------------
     # Metrics
     # ------------------------------------------------------------------
@@ -58,18 +63,15 @@ class SlidingWindowTelemetry:
         idx = max(0, int(0.99 * len(ttfts)) - 1)
         return ttfts[idx]
 
-    def jain_fairness_index(self) -> float:
-        """
-        Jain's Fairness Index over per-client prompt tokens in the window.
-        J = (Σ x_i)² / (n · Σ x_i²),  range [1/n, 1],  1 = perfectly fair.
-        Returns 1.0 if fewer than 2 distinct clients are present.
-        """
-        if not self.window:
-            return 1.0
-        client_tokens: Dict[str, int] = defaultdict(int)
-        for r in self.window:
-            client_tokens[r.client_id] += r.prompt_len
-        x = list(client_tokens.values())
+    @staticmethod
+    def _extend_tokens(rec: CompletedReqRecord) -> int:
+        if rec.cached_len < 0:
+            return rec.prompt_len
+        return max(rec.prompt_len - rec.cached_len, 0)
+
+    @staticmethod
+    def _jain_from_service(client_service: Dict[str, int]) -> float:
+        x = list(client_service.values())
         n = len(x)
         if n < 2:
             return 1.0
@@ -78,6 +80,33 @@ class SlidingWindowTelemetry:
         if sum_x2 == 0:
             return 1.0
         return (sum_x ** 2) / (n * sum_x2)
+
+    def jain_fairness_index(self) -> float:
+        """
+        Cache-aware control Jain over extend_tokens + 2 * output_tokens.
+        J = (Σ x_i)² / (n · Σ x_i²),  range [1/n, 1],  1 = perfectly fair.
+        Returns 1.0 if fewer than 2 distinct clients are present.
+        """
+        if not self.window:
+            return 1.0
+        client_service: Dict[str, int] = defaultdict(int)
+        for r in self.window:
+            client_service[r.client_id] += self._extend_tokens(r) + 2 * r.output_tokens
+        return self._jain_from_service(client_service)
+
+    def jain_fairness_index_prompt(self) -> float:
+        """
+        Prompt-based Jain over prompt_len + 2 * output_tokens.
+
+        This preserves the previous accounting as a debug-only signal so we can
+        compare it against the cache-aware control Jain during reruns.
+        """
+        if not self.window:
+            return 1.0
+        client_service: Dict[str, int] = defaultdict(int)
+        for r in self.window:
+            client_service[r.client_id] += r.prompt_len + 2 * r.output_tokens
+        return self._jain_from_service(client_service)
 
     def cache_hit_rate(self) -> float:
         """Fraction of prompt tokens served from the radix cache."""
@@ -133,8 +162,7 @@ class AIMDController:
         self.telemetry = telemetry
         self.current_Q: float = config.Q_init
         self._step_count: int = 0
-        # History for plotting: list of (wall_time, Q, jain, p99_ttft_ms)
-        self.history: List[Tuple[float, float, float, float]] = []
+        self.history: List[Dict[str, Any]] = []
 
     def step(self) -> None:
         """Called once per scheduling step. Updates Q every control_interval steps."""
@@ -142,10 +170,22 @@ class AIMDController:
         if self._step_count % self.config.control_interval != 0:
             return
 
-        jain = self.telemetry.jain_fairness_index()
+        jain_control = self.telemetry.jain_fairness_index()
+        jain_prompt = self.telemetry.jain_fairness_index_prompt()
         p99_ms = self.telemetry.p99_ttft() * 1000.0
+        max_wait_ms = self.telemetry.max_wait_time() * 1000.0
 
-        violated = jain < self.config.jain_threshold or p99_ms > self.config.ttft_slo_ms
+        jain_violated = jain_control < self.config.jain_threshold
+        ttft_violated = p99_ms > self.config.ttft_slo_ms
+        violated = jain_violated or ttft_violated
+        if jain_violated and ttft_violated:
+            violation_reason = "both"
+        elif jain_violated:
+            violation_reason = "jain"
+        elif ttft_violated:
+            violation_reason = "ttft"
+        else:
+            violation_reason = "none"
 
         if violated:
             new_Q = max(self.config.Q_min, self.current_Q * self.config.multiplicative_factor)
@@ -153,25 +193,43 @@ class AIMDController:
             new_Q = min(self.config.Q_max, self.current_Q + self.config.additive_step)
 
         self.current_Q = new_Q
-        self.history.append((time.perf_counter(), new_Q, jain, p99_ms))
+        now = time.perf_counter()
+        entry = {
+            "t": now,
+            "step": self._step_count,
+            "Q": float(new_Q),
+            # Keep `jain` as a compatibility alias for existing plots/scripts.
+            "jain": float(jain_control),
+            "jain_control": float(jain_control),
+            "jain_prompt": float(jain_prompt),
+            "p99_ttft_ms": float(p99_ms),
+            "max_wait_ms": float(max_wait_ms),
+            "violated": bool(violated),
+            "violation_reason": violation_reason,
+        }
+        self.history.append(entry)
 
         if self.config.debug_log_path:
             try:
                 with open(self.config.debug_log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps({
-                        "t": time.perf_counter(),
-                        "step": self._step_count,
-                        "Q": float(new_Q),
-                        "jain": float(jain),
-                        "p99_ttft_ms": float(p99_ms),
-                        "violated": bool(violated),
-                    }) + "\n")
+                    f.write(json.dumps(entry) + "\n")
             except Exception:
                 # Never break scheduler progress due to debug logging.
                 pass
 
     def get_Q(self) -> float:
         return self.current_Q
+
+    def reset(self) -> None:
+        """Restore the controller to its initial configuration for a fresh run."""
+        self.current_Q = self.config.Q_init
+        self._step_count = 0
+        self.history.clear()
+        if self.config.debug_log_path:
+            try:
+                open(self.config.debug_log_path, "w", encoding="utf-8").close()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -221,13 +279,27 @@ class RequestLogger:
         }
         self._req_file.write(json.dumps(record) + "\n")
 
-    def flush_q_history(self, history: List[Tuple[float, float, float, float]]) -> None:
-        """Write Q trajectory to CSV. history entries: (wall_time, Q, jain, p99_ttft_ms)."""
+    def flush_q_history(self, history: List[Dict[str, Any]]) -> None:
+        """Write enriched AIMD history to CSV for offline analysis."""
         if not history:
             return
         with open(self._q_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["wall_time", "Q", "jain_index", "p99_ttft_ms"])
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "t",
+                    "step",
+                    "Q",
+                    "jain",
+                    "jain_control",
+                    "jain_prompt",
+                    "p99_ttft_ms",
+                    "max_wait_ms",
+                    "violated",
+                    "violation_reason",
+                ],
+            )
+            writer.writeheader()
             writer.writerows(history)
 
     def close(self) -> None:
