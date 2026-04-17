@@ -23,6 +23,7 @@ from minisgl.message import (
     BatchBackendMsg,
     DetokenizeMsg,
     ExitMsg,
+    ResetBackendMsg,
     UserMsg,
 )
 from minisgl.utils import init_logger, load_tokenizer
@@ -187,6 +188,20 @@ class Scheduler(SchedulerIOMixin):
         self.sync_all_ranks()
         self.engine.shutdown()
 
+    def reset_experiment_state(self) -> None:
+        """
+        Clear per-run AIMD and fairness state while keeping the service alive.
+
+        This is intended for the experiment harness after warmup completes, so
+        the measured probe starts from a clean controller/telemetry baseline.
+        """
+        self.telemetry.reset()
+        if self.controller is not None:
+            self.controller.reset()
+        self.prefill_manager.deficit_state.reset()
+        self._req_meta.clear()
+        self._first_token_time.clear()
+
     def _flush_logs(self) -> None:
         """Flush Q trajectory to CSV and close the request log file."""
         if self._req_logger is None:
@@ -253,6 +268,7 @@ class Scheduler(SchedulerIOMixin):
                             ttft=ttft_s,
                             prompt_len=orig_prompt_len,
                             cached_len=cached_len,
+                            output_tokens=output_tokens,
                         ))
                         if self._req_logger is not None:
                             self._req_logger.log_request(
@@ -297,6 +313,9 @@ class Scheduler(SchedulerIOMixin):
             # orig_prompt_len captured now; cached_len and q_at_scheduling filled at scheduling
             self._req_meta[msg.uid] = (client_id, time.perf_counter(), len(msg.input_ids), 0, 0.0)
             self.prefill_manager.add_one_req(msg)
+        elif isinstance(msg, ResetBackendMsg):
+            logger.info_rank0("Resetting AIMD experiment state (scope=%s)", msg.scope)
+            self.reset_experiment_state()
         elif isinstance(msg, AbortBackendMsg):
             logger.debug_rank0("Aborting request %d", msg.uid)
             self._req_meta.pop(msg.uid, None)

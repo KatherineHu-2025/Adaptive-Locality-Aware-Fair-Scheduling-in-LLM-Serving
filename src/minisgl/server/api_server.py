@@ -23,6 +23,7 @@ from minisgl.message import (
     BaseFrontendMsg,
     BaseTokenizerMsg,
     BatchFrontendMsg,
+    ResetMsg,
     TokenizeMsg,
     UserReply,
 )
@@ -64,6 +65,10 @@ class GenerateRequest(BaseModel):
     # Callers set this to identify which tenant the request belongs to.
     # Defaults to "" so existing clients that don't send it still work.
     client_id: str = ""
+
+
+class ResetRequest(BaseModel):
+    scope: str = "experiment"
 
 
 class Message(BaseModel):
@@ -259,6 +264,13 @@ async def generate(req: GenerateRequest, request: Request):
         state.stream_with_cancellation(state.stream_generate(uid), request, uid),
         media_type="text/event-stream",
     )
+
+
+@app.post("/reset_experiment")
+async def reset_experiment(req: ResetRequest):
+    state = get_global_state()
+    await state.send_one(ResetMsg(scope=req.scope))
+    return {"ok": True, "scope": req.scope}
 
 
 @app.api_route("/v1", methods=["GET", "POST", "HEAD", "OPTIONS"])
