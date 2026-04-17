@@ -264,6 +264,50 @@ async def _send_one(
 
 
 # ---------------------------------------------------------------------------
+# Sequential per-client coroutine
+# ---------------------------------------------------------------------------
+
+async def _run_client_sequential(
+    specs: List[RequestSpec],
+    session: "aiohttp.ClientSession",
+    server_url: str,
+    policy: str,
+    t0: float,
+    timeout: float,
+    results: List["RequestResult"],
+    out_file,
+    initial_delay: float = 0.0,
+) -> None:
+    """
+    Send one client's requests strictly in order, waiting for each response
+    before sending the next.  All clients run this coroutine concurrently,
+    so inter-client parallelism is preserved while intra-client ordering is
+    enforced.
+
+    initial_delay — seconds to wait before sending the first turn.  Derived
+    from the conversation's rescaled tstamp so that different clients start
+    at staggered times, matching the paper's timestamp-rescaling approach.
+
+    This models the paper's multi-turn workload: turn N+1 can only be
+    submitted after the server has responded to turn N, ensuring the turn-N
+    prefix is in the cache when turn N+1 arrives.
+    """
+    if initial_delay > 0.0:
+        await asyncio.sleep(initial_delay)
+    for spec in specs:
+        result = await _send_one(session, spec, server_url, policy, t0, timeout)
+        results.append(result)
+        if out_file:
+            out_file.write(json.dumps(asdict(result)) + "\n")
+            out_file.flush()
+        status = "OK" if result.success else f"FAIL({result.error[:40]})"
+        print(
+            f"[{result.arrival_time:6.2f}s] {result.client_id:<20} "
+            f"ttft={result.ttft_ms:7.1f}ms  tokens={result.output_tokens:4d}  {status}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main replay function
 # ---------------------------------------------------------------------------
 
@@ -295,8 +339,13 @@ async def replay(
     output_path     : if given, write one JSON line per result to this file
     seed            : random seed for Gamma inter-arrivals (default 42)
     timeout         : per-request HTTP timeout in seconds
-    max_concurrency : maximum simultaneous in-flight requests
-    arrival_mode    : arrival process mode: "global" or "per-client"
+    max_concurrency : maximum simultaneous in-flight requests (ignored for
+                      sequential mode — one connection per client)
+    arrival_mode    : "global"     — one Gamma process over all requests
+                      "per-client" — one Gamma process per client_id, merged
+                      "sequential" — one coroutine per client; turns sent in
+                                     order, each waiting for the previous
+                                     response (models real multi-turn chat)
 
     Returns
     -------
@@ -305,6 +354,70 @@ async def replay(
     if not specs:
         return []
 
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        out_file = open(output_path, "w")
+    else:
+        out_file = None
+
+    results: List[RequestResult] = []
+
+    # ------------------------------------------------------------------
+    # Sequential mode: each client's requests are sent in order, waiting
+    # for each response before sending the next.  All clients run their
+    # coroutines concurrently, so inter-client parallelism is preserved.
+    # This models the paper's multi-turn workload (Fig. 6d) where turn
+    # N+1 is only submitted after the server responds to turn N, ensuring
+    # the prefix is cached when the next turn arrives.
+    # ------------------------------------------------------------------
+    if arrival_mode == "sequential":
+        by_client: dict[str, List[RequestSpec]] = {}
+        for spec in specs:
+            by_client.setdefault(spec.client_id, []).append(spec)
+
+        # Rescale per-client start times so the mean inter-client arrival
+        # rate matches `rate`.  Each client's raw start time is the
+        # arrival_time stored on its first RequestSpec (set by the dataset
+        # loader from the real tstamp, relative to the earliest conversation).
+        # If no client has a non-zero start time (e.g. synthetic / LooGLE),
+        # scale_factor stays 1.0 and all clients start at t=0.
+        raw_starts = sorted(
+            cspecs[0].arrival_time
+            for cspecs in by_client.values()
+            if cspecs[0].arrival_time > 0.0
+        )
+        if len(raw_starts) >= 2 and rate > 0.0:
+            interarrivals = [
+                b - a for a, b in zip([0.0] + raw_starts[:-1], raw_starts)
+            ]
+            mean_interarrival = sum(interarrivals) / len(interarrivals)
+            # scale_factor s.t. rescaled mean inter-arrival = 1/rate
+            scale_factor = mean_interarrival * rate
+        else:
+            scale_factor = 1.0
+
+        n_clients = max(len(by_client), 1)
+        connector = aiohttp.TCPConnector(limit=n_clients)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            t0 = time.perf_counter()
+            tasks = [
+                asyncio.create_task(
+                    _run_client_sequential(
+                        cspecs, session, server_url, policy, t0, timeout, results, out_file,
+                        initial_delay=cspecs[0].arrival_time / scale_factor,
+                    )
+                )
+                for cspecs in by_client.values()
+            ]
+            await asyncio.gather(*tasks)
+
+        if out_file:
+            out_file.close()
+        return results
+
+    # ------------------------------------------------------------------
+    # Gamma-arrival modes: "global" and "per-client"
+    # ------------------------------------------------------------------
     arrival_plan = build_arrival_plan(
         specs=specs,
         rate=rate,
@@ -313,13 +426,6 @@ async def replay(
         arrival_mode=arrival_mode,
     )
     semaphore = asyncio.Semaphore(max_concurrency)
-    results: List[RequestResult] = []
-
-    if output_path:
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        out_file = open(output_path, "w")
-    else:
-        out_file = None
 
     async def _throttled(spec: RequestSpec, session: aiohttp.ClientSession, t0: float):
         async with semaphore:
@@ -354,6 +460,37 @@ async def replay(
 
 
 # ---------------------------------------------------------------------------
+# Active-window helper
+# ---------------------------------------------------------------------------
+
+def _active_window(results: List[RequestResult]) -> tuple:
+    """
+    Return (t_start, t_end) of the interval when ALL clients are simultaneously
+    active, following the paper's Jain and throughput measurement convention.
+
+        t_start = max(each client's earliest arrival_time)   ← last client joins
+        t_end   = min(each client's latest completion_time)  ← first client finishes
+        completion_time = arrival_time + ttft_ms / 1000.0
+
+    Only successful requests are used. Returns (0.0, inf) when fewer than 2
+    clients are present (single-client runs have no meaningful active window).
+    """
+    from collections import defaultdict
+    successful = [r for r in results if r.success]
+    by_client: dict = defaultdict(list)
+    for r in successful:
+        by_client[r.client_id].append(r)
+    if len(by_client) < 2:
+        return (0.0, float("inf"))
+    t_start = max(min(r.arrival_time for r in reqs) for reqs in by_client.values())
+    t_end = min(
+        max(r.arrival_time + r.ttft_ms / 1000.0 for r in reqs)
+        for reqs in by_client.values()
+    )
+    return (t_start, max(t_start, t_end))
+
+
+# ---------------------------------------------------------------------------
 # Summary printer
 # ---------------------------------------------------------------------------
 
@@ -363,11 +500,12 @@ def print_summary(results: List[RequestResult]) -> None:
         print("No results.")
         return
 
+    from collections import defaultdict
+
     successful = [r for r in results if r.success]
     failed = [r for r in results if not r.success]
 
     ttfts = sorted(r.ttft_ms for r in successful)
-    n = len(ttfts)
 
     def pct(lst, p):
         if not lst:
@@ -379,13 +517,26 @@ def print_summary(results: List[RequestResult]) -> None:
 
     print("\n" + "=" * 60)
     print(f"Requests:     {len(results)}  ({len(successful)} OK, {len(failed)} failed)")
-    print(f"Throughput:   {total_tokens / max(total_wall, 1e-9):.1f} tokens/sec")
+    print(f"Throughput:   {total_tokens / max(total_wall, 1e-9):.1f} tokens/sec  (overall)")
     if ttfts:
         print(f"TTFT P50:     {pct(ttfts, 0.50):.1f} ms")
         print(f"TTFT P99:     {pct(ttfts, 0.99):.1f} ms")
 
+    # Active-window throughput and Jain — paper-faithful metrics computed over
+    # the interval when all clients are simultaneously active (§6.1).
+    t_start, t_end = _active_window(results)
+    active_duration = max(t_end - t_start, 1e-9)
+    active_reqs = [
+        r for r in successful
+        if t_start <= r.arrival_time
+        and r.arrival_time + r.ttft_ms / 1000.0 <= t_end
+    ]
+    active_tokens = sum(r.output_tokens for r in active_reqs)
+    if total_wall > 0 and t_end < float("inf"):
+        print(f"Throughput:   {active_tokens / active_duration:.1f} tokens/sec  "
+              f"(active window {t_start:.1f}s–{t_end:.1f}s, {len(active_reqs)} reqs)")
+
     # Per-client breakdown
-    from collections import defaultdict
     by_client: dict = defaultdict(list)
     for r in successful:
         by_client[r.client_id].append(r.ttft_ms)
@@ -396,15 +547,38 @@ def print_summary(results: List[RequestResult]) -> None:
             med = sorted(ttft_list)[len(ttft_list) // 2]
             print(f"  {cid:<30} {med:8.1f} ms  ({len(ttft_list)} reqs)")
 
-    # Jain Fairness Index over per-client token counts
-    client_tokens = {
-        cid: sum(r.output_tokens for r in successful if r.client_id == cid)
+    # Jain — overall (all completed requests)
+    def _jain(service_vals):
+        x = list(service_vals)
+        if len(x) < 2 or sum(xi ** 2 for xi in x) == 0:
+            return float("nan")
+        return sum(x) ** 2 / (len(x) * sum(xi ** 2 for xi in x))
+
+    # paper formula (§3): service_i = extend_tokens×1 + output_tokens×2
+    # extend_tokens = prompt_len - cached_len (cached tokens cost nothing to recompute).
+    # cached_len is -1 when the server did not return it; fall back to prompt_len in that case.
+    def _extend(r: RequestResult) -> int:
+        if r.cached_len >= 0:
+            return max(r.prompt_len - r.cached_len, 0)
+        return r.prompt_len
+
+    overall_service = {
+        cid: sum(_extend(r) + 2 * r.output_tokens for r in successful if r.client_id == cid)
         for cid in by_client
     }
-    x = list(client_tokens.values())
-    if len(x) >= 2:
-        jain = sum(x) ** 2 / (len(x) * sum(xi ** 2 for xi in x))
-        print(f"\nJain Fairness Index: {jain:.4f}")
+    print(f"\nJain (overall, extend+2×output):        {_jain(overall_service.values()):.4f}")
+
+    # Jain — active window only
+    active_by_client: dict = defaultdict(list)
+    for r in active_reqs:
+        active_by_client[r.client_id].append(r)
+    if len(active_by_client) >= 2:
+        active_service = {
+            cid: sum(_extend(r) + 2 * r.output_tokens for r in reqs)
+            for cid, reqs in active_by_client.items()
+        }
+        print(f"Jain (active window, extend+2×output):  {_jain(active_service.values()):.4f}")
+
     print("=" * 60)
 
 
@@ -417,8 +591,14 @@ def _parse_args():
     p.add_argument("--server",  default="http://127.0.0.1:19190")
     p.add_argument("--dataset", choices=["synthetic", "loogle", "chatbot_arena"],
                    default="synthetic")
-    p.add_argument("--arrival-mode", choices=["global", "per-client"], default="global",
-                   help="Arrival process mode: one global Gamma process or one per client")
+    p.add_argument("--arrival-mode", choices=["global", "per-client", "sequential"], default="global",
+                   help=(
+                       "Arrival process mode: "
+                       "'global' = one Gamma process for all requests; "
+                       "'per-client' = one Gamma process per client, merged by timestamp; "
+                       "'sequential' = turns sent in order per client, waiting for each response "
+                       "(recommended for chatbot_arena and loogle to model real prefix-cache reuse)"
+                   ))
     p.add_argument("--rate",    type=float, default=2.0,
                    help="Target arrival rate (req/sec)")
     p.add_argument("--k",       type=float, default=1.0,
@@ -431,6 +611,10 @@ def _parse_args():
     p.add_argument("--seed",    type=int, default=42)
     p.add_argument("--dominant-reqs", type=int, default=80)
     p.add_argument("--cold-reqs",     type=int, default=20)
+    p.add_argument("--num-dominant-clients", type=int, default=1,
+                   help="Number of distinct dominant client IDs (each shares the same system prompt)")
+    p.add_argument("--num-cold-clients", type=int, default=1,
+                   help="Number of distinct cold client IDs (each sends unique prompts)")
     p.add_argument("--timeout", type=float, default=120.0,
                    help="Per-request HTTP timeout in seconds")
     p.add_argument("--max-concurrency", type=int, default=64,
@@ -447,9 +631,14 @@ async def _main():
         specs = load_synthetic(
             dominant_reqs=args.dominant_reqs,
             cold_reqs=args.cold_reqs,
+            num_dominant_clients=args.num_dominant_clients,
+            num_cold_clients=args.num_cold_clients,
         )
     elif args.dataset == "loogle":
-        specs = load_loogle(max_docs=args.max_reqs, one_per_doc=True)
+        # one_per_doc=False: keep all QA pairs per document so that multiple
+        # questions from the same doc share the long document prefix — matching
+        # the paper's Long-Context QA workload (Fig. 6a: Long Doc → Q1A1, Q2A2, Q3A3).
+        specs = load_loogle(max_docs=args.max_reqs, one_per_doc=False)
     elif args.dataset == "chatbot_arena":
         from workload.dataset import load_chatbot_arena
         specs = load_chatbot_arena(max_conversations=args.max_reqs, min_turns=args.min_turns)

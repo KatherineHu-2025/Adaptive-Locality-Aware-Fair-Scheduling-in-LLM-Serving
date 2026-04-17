@@ -120,7 +120,12 @@ def load_chatbot_arena(
     if language is not None:
         ds = ds.filter(lambda ex: ex["language"] == language)
 
-    specs: List[RequestSpec] = []
+    # First pass: collect (tstamp, [RequestSpec, ...]) per conversation.
+    # tstamp is a Unix timestamp (float) recording when the conversation was
+    # submitted to Chatbot Arena — one value per conversation, not per turn.
+    # We use it to stagger when each client starts in sequential replay mode,
+    # matching the paper's "re-scale the request timestamps" approach (§6.3).
+    conv_data: List[tuple[float, List[RequestSpec]]] = []
     n_conversations = 0
 
     for ex in ds:
@@ -131,6 +136,7 @@ def load_chatbot_arena(
         # use conversation_a for the assistant responses (output length est.)
         turns = ex["conversation_a"]
         client_id: str = ex["question_id"]
+        tstamp: float = float(ex.get("tstamp", 0.0))
 
         # Separate into (user_msg, assistant_msg) pairs
         pairs: List[tuple[str, str]] = []
@@ -145,13 +151,16 @@ def load_chatbot_arena(
         if len(pairs) < min_turns:
             continue
 
-        # Build prompts with growing context (prefix-cache friendly)
+        # Build prompts with growing context (prefix-cache friendly).
+        # All turns in this conversation share the same tstamp; arrival_time
+        # is set below after normalization (second pass).
+        conv_specs: List[RequestSpec] = []
         context_parts: List[str] = []
         for user_msg, assistant_msg in pairs:
             context_parts.append(f"Human: {user_msg}")
             prompt = "\n".join(context_parts)
             output_len = token_len_fn(assistant_msg)
-            specs.append(RequestSpec(
+            conv_specs.append(RequestSpec(
                 client_id=client_id,
                 prompt=prompt,
                 expected_output_len=output_len,
@@ -159,9 +168,21 @@ def load_chatbot_arena(
             ))
             context_parts.append(f"Assistant: {assistant_msg}")
 
+        if conv_specs:
+            conv_data.append((tstamp, conv_specs))
         n_conversations += 1
 
-    return specs
+    # Second pass: normalize timestamps so the earliest conversation starts at
+    # t=0. Store the relative offset (seconds) on the FIRST turn of each
+    # conversation only — subsequent turns keep arrival_time=0.0 because
+    # sequential replay mode (arrival_mode="sequential") sends them in order
+    # after each response, and does not consult their arrival_time.
+    if conv_data:
+        min_tstamp = min(t for t, _ in conv_data)
+        for tstamp, conv_specs in conv_data:
+            conv_specs[0].arrival_time = tstamp - min_tstamp
+
+    return [s for _, conv_specs in conv_data for s in conv_specs]
 
 
 # ---------------------------------------------------------------------------
@@ -183,22 +204,25 @@ def load_synthetic(
     system_prompt: str = _SYSTEM_PROMPT,
     dominant_output_len: int = 64,
     cold_output_len: int = 128,
+    num_dominant_clients: int = 1,
+    num_cold_clients: int = 1,
 ) -> List[RequestSpec]:
     """
-    Generate a two-client starvation workload (no download needed).
+    Generate a multi-client starvation workload (no download needed).
 
-    dominant client ("client_dominant")
-        Sends `dominant_reqs` requests, each starting with `system_prompt`
-        followed by a short unique question. High prefix-cache hit rate —
-        the system prompt is always cached after the first request.
+    dominant clients ("client_dominant_0", "client_dominant_1", ...)
+        Each sends dominant_reqs // num_dominant_clients requests, all
+        starting with the same system_prompt. High prefix-cache hit rate —
+        the system prompt is always cached after the first request from any
+        dominant client.
 
-    cold client ("client_cold")
-        Sends `cold_reqs` requests with unique, unrelated prompts.
-        No shared prefix → always triggers a cold-start prefill.
-        Under LPM, this client is always deprioritized.
+    cold clients ("client_cold_0", "client_cold_1", ...)
+        Each sends cold_reqs // num_cold_clients requests with unique,
+        unrelated prompts. No shared prefix → always cold-start prefill.
+        Under LPM, these clients are always deprioritized.
 
-    Under DLPM / Adaptive DLPM, the cold client's growing deficit should
-    eventually force the scheduler to serve it, preventing starvation.
+    More clients → more simultaneous contenders in the pending list →
+    Q affects scheduling order more visibly → AIMD sawtooth is clearer.
 
     Returns
     -------
@@ -206,28 +230,34 @@ def load_synthetic(
     (up to the shorter list, then the remainder of the longer list appended).
     Arrival times are all 0.0 — the workload client assigns real timing.
     """
-    dominant: List[RequestSpec] = [
-        RequestSpec(
-            client_id="client_dominant",
-            prompt=f"{system_prompt}\n\nQuestion {i}: What is {i} + {i}?",
-            expected_output_len=dominant_output_len,
-            arrival_time=0.0,
-        )
-        for i in range(dominant_reqs)
-    ]
+    reqs_per_dominant = max(1, dominant_reqs // num_dominant_clients)
+    reqs_per_cold = max(1, cold_reqs // num_cold_clients)
 
-    cold: List[RequestSpec] = [
-        RequestSpec(
-            client_id="client_cold",
-            prompt=(
-                f"Explain the history and significance of the {_COLD_TOPICS[i % len(_COLD_TOPICS)]} "
-                f"in detail. Request id: {i}."
-            ),
-            expected_output_len=cold_output_len,
-            arrival_time=0.0,
-        )
-        for i in range(cold_reqs)
-    ]
+    dominant: List[RequestSpec] = []
+    for ci in range(num_dominant_clients):
+        client_id = f"client_dominant_{ci}" if num_dominant_clients > 1 else "client_dominant"
+        for i in range(reqs_per_dominant):
+            dominant.append(RequestSpec(
+                client_id=client_id,
+                prompt=f"{system_prompt}\n\nQuestion {i}: What is {i} + {i}?",
+                expected_output_len=dominant_output_len,
+                arrival_time=0.0,
+            ))
+
+    cold: List[RequestSpec] = []
+    for ci in range(num_cold_clients):
+        client_id = f"client_cold_{ci}" if num_cold_clients > 1 else "client_cold"
+        for i in range(reqs_per_cold):
+            cold.append(RequestSpec(
+                client_id=client_id,
+                prompt=(
+                    f"Explain the history and significance of the "
+                    f"{_COLD_TOPICS[(ci * reqs_per_cold + i) % len(_COLD_TOPICS)]} "
+                    f"in detail. Request id: {i}."
+                ),
+                expected_output_len=cold_output_len,
+                arrival_time=0.0,
+            ))
 
     # Interleave: dominant, cold, dominant, cold, ...
     interleaved: List[RequestSpec] = []
