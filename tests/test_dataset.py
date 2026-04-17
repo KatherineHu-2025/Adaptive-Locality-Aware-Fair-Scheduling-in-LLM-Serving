@@ -234,3 +234,33 @@ class TestLoadChatbotArena:
         from workload.dataset import load_chatbot_arena
         specs = load_chatbot_arena(max_conversations=5, language="English")
         assert all(s.expected_output_len > 0 for s in specs)
+
+    def test_first_turn_has_nonzero_arrival_time(self):
+        """First turns of later conversations should have arrival_time > 0
+        (set from the tstamp field; the very first conversation is 0.0)."""
+        from workload.dataset import load_chatbot_arena
+        from collections import defaultdict
+        specs = load_chatbot_arena(max_conversations=10, language="English")
+        by_client: dict = defaultdict(list)
+        for s in specs:
+            by_client[s.client_id].append(s)
+        first_turns = [reqs[0] for reqs in by_client.values()]
+        # At least one conversation (not the first) must have a positive offset
+        assert any(t.arrival_time > 0 for t in first_turns), (
+            "Expected at least one conversation with arrival_time > 0 from tstamp"
+        )
+
+    def test_subsequent_turns_have_zero_arrival_time(self):
+        """Only the first turn of each conversation carries the tstamp offset;
+        subsequent turns must be 0.0 (sequential mode handles ordering)."""
+        from workload.dataset import load_chatbot_arena
+        from collections import defaultdict
+        specs = load_chatbot_arena(max_conversations=10, min_turns=2, language="English")
+        by_client: dict = defaultdict(list)
+        for s in specs:
+            by_client[s.client_id].append(s)
+        for reqs in by_client.values():
+            for turn in reqs[1:]:
+                assert turn.arrival_time == 0.0, (
+                    f"Turn 2+ should have arrival_time=0.0, got {turn.arrival_time}"
+                )

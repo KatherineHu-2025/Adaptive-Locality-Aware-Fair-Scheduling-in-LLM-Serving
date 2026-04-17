@@ -276,13 +276,14 @@ class TestStarvationScenario:
 # ---------------------------------------------------------------------------
 
 class TestSlidingWindowTelemetry:
-    def _rec(self, client_id, ttft, prompt_len=100, cached_len=0):
+    def _rec(self, client_id, ttft, prompt_len=100, cached_len=0, output_tokens=0):
         return CompletedReqRecord(
             client_id=client_id,
             arrival_time=0.0,
             ttft=ttft,
             prompt_len=prompt_len,
             cached_len=cached_len,
+            output_tokens=output_tokens,
         )
 
     def test_p99_ttft(self):
@@ -293,13 +294,35 @@ class TestSlidingWindowTelemetry:
         assert t.p99_ttft() >= 97.0
 
     def test_jain_index_perfect_fairness(self):
+        # Equal prompt_len + 2*output_tokens per client → Jain = 1.0
         t = SlidingWindowTelemetry()
         for _ in range(10):
-            t.record(self._rec("A", ttft=0.1, prompt_len=100))
-            t.record(self._rec("B", ttft=0.1, prompt_len=100))
+            t.record(self._rec("A", ttft=0.1, prompt_len=80, output_tokens=10))
+            t.record(self._rec("B", ttft=0.1, prompt_len=80, output_tokens=10))
         assert abs(t.jain_fairness_index() - 1.0) < 1e-6
 
+    def test_control_jain_uses_cached_len(self):
+        t = SlidingWindowTelemetry()
+        for _ in range(9):
+            t.record(self._rec("A", ttft=0.1, prompt_len=100, cached_len=90, output_tokens=0))
+        t.record(self._rec("B", ttft=0.1, prompt_len=100, cached_len=0, output_tokens=0))
+        # Extend-token service is [90, 100], which is much fairer than [900, 100].
+        assert t.jain_fairness_index() > 0.95
+        assert t.jain_fairness_index_prompt() < 0.7
+
+    def test_jain_index_uses_output_tokens(self):
+        # A gets prompt=100, output=50 → service=200 per req, 9 reqs → 1800 total
+        # B gets prompt=100, output=0  → service=100 per req, 1 req  → 100 total
+        # Jain over [1800, 100] = (1900)^2 / (2 * (1800^2 + 100^2)) ≈ 0.52 — unfair
+        t = SlidingWindowTelemetry()
+        for _ in range(9):
+            t.record(self._rec("A", ttft=0.1, prompt_len=100, output_tokens=50))
+        t.record(self._rec("B", ttft=0.1, prompt_len=100, output_tokens=0))
+        jain = t.jain_fairness_index()
+        assert jain < 0.7  # highly unfair
+
     def test_jain_index_unfair(self):
+        # A gets prompt=100 × 9 = 900 service; B gets prompt=1 → service=1
         t = SlidingWindowTelemetry()
         for _ in range(9):
             t.record(self._rec("A", ttft=0.1, prompt_len=100))
@@ -325,6 +348,7 @@ class TestSlidingWindowTelemetry:
         t = SlidingWindowTelemetry()
         assert t.p99_ttft() == 0.0
         assert t.jain_fairness_index() == 1.0
+        assert t.jain_fairness_index_prompt() == 1.0
         assert t.cache_hit_rate() == 0.0
 
 
@@ -336,7 +360,9 @@ class TestAIMDController:
     def _make_controller(self, jain=1.0, p99_ttft=0.0, **cfg_kwargs):
         telemetry = MagicMock()
         telemetry.jain_fairness_index.return_value = jain
+        telemetry.jain_fairness_index_prompt.return_value = jain
         telemetry.p99_ttft.return_value = p99_ttft / 1000.0  # convert ms → s
+        telemetry.max_wait_time.return_value = p99_ttft / 1000.0
         # Default control_interval to 1 unless explicitly overridden
         cfg_kwargs.setdefault("control_interval", 1)
         cfg = AIMDConfig(**cfg_kwargs)
@@ -397,7 +423,22 @@ class TestAIMDController:
         ctrl.step()
         ctrl.step()
         assert len(ctrl.history) == 2
-        assert ctrl.history[0][1] == 4500.0  # first step Q value
+        assert ctrl.history[0]["Q"] == 4500.0
+        assert ctrl.history[0]["violation_reason"] == "none"
+
+    def test_history_records_debug_signals(self):
+        ctrl, _ = self._make_controller(jain=0.5, p99_ttft=5000.0,
+                                         Q_init=4000, control_interval=1,
+                                         multiplicative_factor=0.5,
+                                         jain_threshold=0.75, ttft_slo_ms=2000)
+        ctrl.step()
+        record = ctrl.history[0]
+        assert record["jain_control"] == pytest.approx(0.5)
+        assert record["jain_prompt"] == pytest.approx(0.5)
+        assert record["p99_ttft_ms"] == pytest.approx(5000.0)
+        assert record["max_wait_ms"] == pytest.approx(5000.0)
+        assert record["violated"] is True
+        assert record["violation_reason"] == "both"
 
     def test_saw_tooth_pattern(self):
         """Q should increase additively then drop when Jain falls."""
@@ -409,17 +450,21 @@ class TestAIMDController:
 
         # 3 healthy rounds → Q increases
         telemetry.jain_fairness_index.return_value = 0.9
+        telemetry.jain_fairness_index_prompt.return_value = 0.9
         telemetry.p99_ttft.return_value = 0.5
+        telemetry.max_wait_time.return_value = 0.5
         for _ in range(3):
             ctrl.step()
         assert ctrl.current_Q == 5500.0
 
         # 1 violation → Q drops
         telemetry.jain_fairness_index.return_value = 0.5
+        telemetry.jain_fairness_index_prompt.return_value = 0.5
         ctrl.step()
         assert ctrl.current_Q == 2750.0
 
         # Resumes increasing
         telemetry.jain_fairness_index.return_value = 0.9
+        telemetry.jain_fairness_index_prompt.return_value = 0.9
         ctrl.step()
         assert ctrl.current_Q == 3250.0
