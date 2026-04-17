@@ -1,7 +1,10 @@
 """
 Modified minisgl/message/tokenizer.py
-Changes: added `client_id: str` to TokenizeMsg so it survives the
-API server → tokenizer → scheduler pipeline.
+Changes:
+  - added `client_id: str` to TokenizeMsg so it survives the
+    API server → tokenizer → scheduler pipeline
+  - added ResetMsg so the experiment harness can reset AIMD/telemetry state
+    between warmup and the measured probe
 """
 from __future__ import annotations
 
@@ -50,3 +53,10 @@ class TokenizeMsg(BaseTokenizerMsg):
 @dataclass
 class AbortMsg(BaseTokenizerMsg):
     uid: int
+
+
+@dataclass
+class ResetMsg(BaseTokenizerMsg):
+    """Control-plane message used to reset experiment state in the scheduler."""
+
+    scope: str = "experiment"

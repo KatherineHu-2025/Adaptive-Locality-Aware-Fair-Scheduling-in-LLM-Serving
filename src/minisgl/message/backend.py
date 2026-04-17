@@ -1,6 +1,9 @@
 """
 Modified minisgl/message/backend.py
-Changes: added `client_id: str` to UserMsg.
+Changes:
+  - added `client_id: str` to UserMsg
+  - added ResetBackendMsg so tokenizer/control messages can reset scheduler
+    experiment state without restarting the service
 """
 from __future__ import annotations
 
@@ -47,3 +50,8 @@ class UserMsg(BaseBackendMsg):
 @dataclass
 class AbortBackendMsg(BaseBackendMsg):
     uid: int
+
+
+@dataclass
+class ResetBackendMsg(BaseBackendMsg):
+    scope: str = "experiment"

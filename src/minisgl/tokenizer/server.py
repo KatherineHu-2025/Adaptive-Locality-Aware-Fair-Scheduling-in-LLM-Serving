@@ -18,6 +18,8 @@ from minisgl.message import (
     BatchFrontendMsg,
     BatchTokenizerMsg,
     DetokenizeMsg,
+    ResetBackendMsg,
+    ResetMsg,
     TokenizeMsg,
     UserMsg,
     UserReply,
@@ -71,7 +73,10 @@ def tokenize_worker(
             detokenize_msg = [m for m in pending_msg if isinstance(m, DetokenizeMsg)]
             tokenize_msg = [m for m in pending_msg if isinstance(m, TokenizeMsg)]
             abort_msg = [m for m in pending_msg if isinstance(m, AbortMsg)]
-            assert len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) == len(pending_msg)
+            reset_msg = [m for m in pending_msg if isinstance(m, ResetMsg)]
+            assert (
+                len(detokenize_msg) + len(tokenize_msg) + len(abort_msg) + len(reset_msg) == len(pending_msg)
+            )
             if len(detokenize_msg) > 0:
                 replies = detokenize_manager.detokenize(detokenize_msg)
                 batch_output = BatchFrontendMsg(
@@ -108,6 +113,13 @@ def tokenize_worker(
             if len(abort_msg) > 0:
                 batch_output = BatchBackendMsg(
                     data=[AbortBackendMsg(uid=msg.uid) for msg in abort_msg]
+                )
+                if len(batch_output.data) == 1:
+                    batch_output = batch_output.data[0]
+                send_backend.put(batch_output)
+            if len(reset_msg) > 0:
+                batch_output = BatchBackendMsg(
+                    data=[ResetBackendMsg(scope=msg.scope) for msg in reset_msg]
                 )
                 if len(batch_output.data) == 1:
                     batch_output = batch_output.data[0]
