@@ -31,6 +31,7 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -41,6 +42,29 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+
+def _find_modal_python() -> str:
+    """Return the Python executable that has modal installed."""
+    try:
+        subprocess.run([sys.executable, "-c", "import modal"], check=True, capture_output=True)
+        return sys.executable
+    except subprocess.CalledProcessError:
+        pass
+    modal_bin = shutil.which("modal")
+    if modal_bin:
+        bin_dir = Path(modal_bin).parent
+        for name in ("python3", "python"):
+            candidate = bin_dir / name
+            if candidate.exists():
+                try:
+                    subprocess.run([str(candidate), "-c", "import modal"], check=True, capture_output=True)
+                    return str(candidate)
+                except subprocess.CalledProcessError:
+                    pass
+    return sys.executable
+
+
+MODAL_PYTHON = _find_modal_python()
 
 MODAL_URL_RE = re.compile(r"https://[a-zA-Z0-9\-\.]+\.modal\.run")
 MODAL_URL_FUZZY_RE = re.compile(r"https://(?:[a-zA-Z0-9\-\.]|\s)+?\.modal\.\s*r\s*u\s*n")
@@ -105,13 +129,15 @@ def find_modal_url(output: str) -> str | None:
     return matches_sorted[0]
 
 
-def deploy_service(service_name: str, policy: str, use_dummy: bool) -> str:
+def deploy_service(service_name: str, policy: str, use_dummy: bool, extra_env: dict[str, str] | None = None) -> str:
     env = os.environ.copy()
     env["MODAL_MINISGL_POLICY"] = policy
     env["MODAL_MINISGL_DUMMY_WEIGHT"] = "1" if use_dummy else "0"
+    if extra_env:
+        env.update(extra_env)
 
     cmd = [
-        sys.executable,
+        MODAL_PYTHON,
         "-m",
         "modal",
         "deploy",
@@ -334,7 +360,7 @@ def format_run_error(res: subprocess.CompletedProcess[str], tail_chars: int = 40
 
 
 def stop_service(service_name: str) -> None:
-    cmd = [sys.executable, "-m", "modal", "app", "stop", service_name]
+    cmd = [MODAL_PYTHON, "-m", "modal", "app", "stop", service_name]
     print(f"[stop] {' '.join(cmd)}")
     run_cmd(cmd, capture=False)
 
@@ -354,6 +380,8 @@ def run_client_once(
     seed: int,
     out_file: Path,
     min_turns: int = 1,
+    num_dominant_clients: int = 1,
+    num_cold_clients: int = 1,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
@@ -389,6 +417,10 @@ def run_client_once(
             str(dominant_reqs),
             "--cold-reqs",
             str(cold_reqs),
+            "--num-dominant-clients",
+            str(num_dominant_clients),
+            "--num-cold-clients",
+            str(num_cold_clients),
         ])
 
     if dataset == "chatbot_arena" and min_turns > 1:
@@ -443,12 +475,55 @@ def main() -> int:
     parser.add_argument("--stop-service-at-end", action="store_true")
     parser.add_argument("--reuse-existing-url", default="", help="Skip deploy and benchmark this existing service URL")
     parser.add_argument("--output-root", default="results")
+    parser.add_argument("--num-dominant-clients", type=int, default=1,
+                        help="Number of distinct dominant client IDs sharing the same system prompt")
+    parser.add_argument("--num-cold-clients", type=int, default=1,
+                        help="Number of distinct cold client IDs with unique prompts")
+    # Static DLPM Q grid: deploys dlpm once per Q value with Q_MIN=Q_MAX=Q_INIT=Q
+    parser.add_argument("--static-q-values", default="",
+                        help="Comma-separated Q values for static dlpm deployments (e.g. 1200,4000,8000). "
+                             "Ignored for lpm and adaptive_dlpm. Creates one deployment per value.")
+    # Adaptive DLPM knobs passed as deploy-time env vars
+    parser.add_argument("--aimd-jain-threshold", default="0.75",
+                        help="Jain fairness threshold for adaptive_dlpm (AIMD_JAIN_THRESHOLD)")
+    parser.add_argument("--aimd-q-init", default="4000",
+                        help="Initial Q for adaptive_dlpm (AIMD_Q_INIT)")
+    parser.add_argument("--aimd-q-min", default="1200",
+                        help="Q lower bound for adaptive_dlpm (AIMD_Q_MIN)")
+    parser.add_argument("--aimd-q-max", default="16000",
+                        help="Q upper bound for adaptive_dlpm (AIMD_Q_MAX)")
     args = parser.parse_args()
 
     policies = parse_str_list(args.policies)
     rates = parse_float_list(args.rates)
     ks = parse_float_list(args.ks)
     request_counts = parse_int_list(args.request_counts)
+    static_q_values = parse_int_list(args.static_q_values) if args.static_q_values else []
+
+    # Expand policies into (policy, run_label, extra_deploy_env) tuples.
+    # dlpm expands into one entry per static Q value; other policies get one entry.
+    policy_runs: list[tuple[str, str, dict[str, str]]] = []
+    for policy in policies:
+        if policy == "dlpm" and static_q_values:
+            for q in static_q_values:
+                policy_runs.append((
+                    policy,
+                    f"dlpm_q{q}",
+                    {"AIMD_Q_INIT": str(q), "AIMD_Q_MIN": str(q), "AIMD_Q_MAX": str(q)},
+                ))
+        elif policy == "adaptive_dlpm":
+            policy_runs.append((
+                policy,
+                "adaptive_dlpm",
+                {
+                    "AIMD_JAIN_THRESHOLD": args.aimd_jain_threshold,
+                    "AIMD_Q_INIT": args.aimd_q_init,
+                    "AIMD_Q_MIN": args.aimd_q_min,
+                    "AIMD_Q_MAX": args.aimd_q_max,
+                },
+            ))
+        else:
+            policy_runs.append((policy, policy, {}))
 
     if args.reuse_existing_url and len(policies) > 1:
         raise SystemExit(
@@ -476,7 +551,7 @@ def main() -> int:
                     f"but endpoint reports '{reported_policy}' in /healthz."
                 )
 
-            for policy, rate, kval, req_count in itertools.product(policies, rates, ks, request_counts):
+            for (policy, run_label, _), rate, kval, req_count in itertools.product(policy_runs, rates, ks, request_counts):
                 if args.dataset == "synthetic":
                     cold = int(round(req_count * args.cold_fraction))
                     cold = min(max(cold, 1), req_count - 1)
@@ -485,7 +560,7 @@ def main() -> int:
                     cold = 0
                     dominant = 0
 
-                out_file = run_dir / f"{policy}_r{rate}_k{kval}_n{req_count}.jsonl"
+                out_file = run_dir / f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
                 res = run_client_once(
                     base_url=base_url,
                     policy=policy,
@@ -501,12 +576,14 @@ def main() -> int:
                     seed=args.seed,
                     out_file=out_file,
                     min_turns=args.min_turns,
+                    num_dominant_clients=args.num_dominant_clients,
+                    num_cold_clients=args.num_cold_clients,
                 )
 
                 if res.returncode != 0 or not out_file.exists():
                     run_error = format_run_error(res)
                     print(
-                        f"[error] policy={policy} rate={rate} k={kval} n={req_count} "
+                        f"[error] policy={run_label} rate={rate} k={kval} n={req_count} "
                         f"return_code={res.returncode}; output not available"
                     )
                     print(run_error)
@@ -516,7 +593,7 @@ def main() -> int:
                             "(e.g., `huggingface-cli login` or set HUGGINGFACE_HUB_TOKEN)."
                         )
                     row = make_failed_row(
-                        policy,
+                        run_label,
                         args.dataset,
                         rate,
                         kval,
@@ -529,7 +606,7 @@ def main() -> int:
                 else:
                     row = summarize_jsonl(
                         out_file,
-                        policy,
+                        run_label,
                         args.dataset,
                         rate,
                         kval,
@@ -541,21 +618,22 @@ def main() -> int:
                 row["server_url"] = base_url
                 summaries.append(row)
                 print(
-                    f"[done] policy={policy} rate={rate} k={kval} n={req_count} "
+                    f"[done] policy={run_label} rate={rate} k={kval} n={req_count} "
                     f"success={row['success_count']}/{row['total_requests']} "
                     f"p50={row['ttft_p50_ms']:.1f}ms p99={row['ttft_p99_ms']:.1f}ms"
                 )
         else:
-            for policy in policies:
+            for policy, run_label, extra_env in policy_runs:
                 # Force a fresh app session for each policy so deploy-time env changes are applied.
                 stop_service(args.service_name)
                 base_url = deploy_service(
                     service_name=args.service_name,
                     policy=policy,
                     use_dummy=args.use_dummy_weight,
+                    extra_env=extra_env,
                 ).rstrip("/")
                 health = wait_for_health(base_url)
-                print(f"[health] {policy}: {health}")
+                print(f"[health] {run_label}: {health}")
                 reported_policy = str(health.get("policy", ""))
                 if reported_policy and reported_policy != policy:
                     raise RuntimeError(
@@ -572,7 +650,7 @@ def main() -> int:
                         cold = 0
                         dominant = 0
 
-                    out_file = run_dir / f"{policy}_r{rate}_k{kval}_n{req_count}.jsonl"
+                    out_file = run_dir / f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
                     res = run_client_once(
                         base_url=base_url,
                         policy=policy,
@@ -588,6 +666,8 @@ def main() -> int:
                         seed=args.seed,
                         out_file=out_file,
                         min_turns=args.min_turns,
+                        num_dominant_clients=args.num_dominant_clients,
+                        num_cold_clients=args.num_cold_clients,
                     )
 
                     if res.returncode != 0 or not out_file.exists():
