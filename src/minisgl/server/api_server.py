@@ -38,6 +38,7 @@ from .args import ServerArgs
 logger = init_logger(__name__, "FrontendAPI")
 
 _GLOBAL_STATE = None
+_STREAM_META_PREFIX = "__MINISGL_META__ "
 
 
 def get_global_state() -> FrontendManager:
@@ -168,8 +169,23 @@ class FrontendManager:
 
     async def stream_generate(self, uid: int):
         async for ack in self.wait_for_ack(uid):
-            yield f"data: {ack.incremental_output}\n".encode()
+            if ack.incremental_output:
+                yield f"data: {ack.incremental_output}\n".encode()
             if ack.finished:
+                meta_payload = json.dumps(
+                    {
+                        "cached_len": ack.cached_len,
+                        "Q_at_scheduling": ack.q_at_scheduling,
+                        "jain_control": ack.jain_control,
+                        "jain_prompt": ack.jain_prompt,
+                        "p99_ttft_ms": ack.p99_ttft_ms,
+                        "aimd_violated": ack.aimd_violated,
+                        "aimd_violation_reason": ack.aimd_violation_reason,
+                        "aimd_step": ack.aimd_step,
+                    },
+                    separators=(",", ":"),
+                )
+                yield f"data: {_STREAM_META_PREFIX}{meta_payload}\n".encode()
                 break
         yield "data: [DONE]\n".encode()
         logger.debug("Finished streaming response for user %s", uid)

@@ -280,6 +280,7 @@ def load_loogle(
     split: str = "test",
     max_docs: Optional[int] = None,
     one_per_doc: bool = False,
+    max_input_tokens: Optional[int] = 26000,
     token_len_fn: Callable[[str], int] = _word_count_estimator,
 ) -> List[RequestSpec]:
     """
@@ -310,6 +311,11 @@ def load_loogle(
     max_docs        Cap on distinct documents to load (None = all).
     one_per_doc     If True, keep only the first QA pair per doc_id so every
                     request is a guaranteed cold start (no shared prefix).
+    max_input_tokens
+                    Conservative estimated-token budget for prompt input only
+                    (context + question). If exceeded, the context is truncated
+                    to fit this budget using token_len_fn. Set to None to
+                    disable truncation.
     token_len_fn    Callable(text) -> int for estimating output length.
 
     Returns
@@ -326,6 +332,7 @@ def load_loogle(
     specs: List[RequestSpec] = []
     seen_docs: dict = {}   # doc_id → count of QA pairs already added
     n_docs = 0
+    truncated_count = 0
 
     for ex in ds:
         doc_id: str = ex["doc_id"]
@@ -343,7 +350,29 @@ def load_loogle(
         question: str = ex["question"]
         answer: str = ex["answer"]
 
-        prompt = f"{context}\n\nQuestion: {question}"
+        question_suffix = f"\n\nQuestion: {question}"
+        prompt = f"{context}{question_suffix}"
+
+        if max_input_tokens is not None and token_len_fn(prompt) > max_input_tokens:
+            # Keep the beginning of the document so requests from the same doc
+            # still share a common prefix for cache-locality experiments.
+            context_words = context.split()
+            lo, hi = 0, len(context_words)
+            best = 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                candidate_context = " ".join(context_words[:mid])
+                candidate_prompt = f"{candidate_context}{question_suffix}"
+                if token_len_fn(candidate_prompt) <= max_input_tokens:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+
+            context = " ".join(context_words[:best])
+            prompt = f"{context}{question_suffix}"
+            truncated_count += 1
+
         output_len = max(token_len_fn(answer), 8)  # answers are short; floor at 8
 
         specs.append(RequestSpec(
@@ -353,6 +382,11 @@ def load_loogle(
             arrival_time=0.0,
         ))
         seen_docs[doc_id] += 1
+
+    if truncated_count > 0:
+        print(
+            f"[load_loogle] Truncated {truncated_count} prompts to max_input_tokens={max_input_tokens}"
+        )
 
     return specs
 

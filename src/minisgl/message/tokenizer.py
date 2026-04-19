@@ -37,6 +37,15 @@ class DetokenizeMsg(BaseTokenizerMsg):
     uid: int
     next_token: int
     finished: bool
+    # Per-request scheduler metadata; populated on every ack.
+    cached_len: int = -1
+    q_at_scheduling: float = -1.0
+    jain_control: float = -1.0
+    jain_prompt: float = -1.0
+    p99_ttft_ms: float = -1.0
+    aimd_violated: bool = False
+    aimd_violation_reason: str = "none"
+    aimd_step: int = -1
 
 
 @dataclass

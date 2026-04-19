@@ -85,6 +85,14 @@ def tokenize_worker(
                             uid=msg.uid,
                             incremental_output=reply,
                             finished=msg.finished,
+                            cached_len=msg.cached_len,
+                            q_at_scheduling=msg.q_at_scheduling,
+                            jain_control=msg.jain_control,
+                            jain_prompt=msg.jain_prompt,
+                            p99_ttft_ms=msg.p99_ttft_ms,
+                            aimd_violated=msg.aimd_violated,
+                            aimd_violation_reason=msg.aimd_violation_reason,
+                            aimd_step=msg.aimd_step,
                         )
                         for msg, reply in zip(detokenize_msg, replies, strict=True)
                     ]

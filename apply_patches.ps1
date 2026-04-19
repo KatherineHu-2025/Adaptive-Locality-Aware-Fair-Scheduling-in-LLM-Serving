@@ -32,6 +32,8 @@ Write-Host "Applying patches to $pkg ..."
 $files = @(
     @{ Src = "minisgl/scheduler/telemetry.py"; Dst = "scheduler/telemetry.py" },
     @{ Src = "minisgl/scheduler/policies.py"; Dst = "scheduler/policies.py" },
+    @{ Src = "minisgl/message/__init__.py"; Dst = "message/__init__.py" },
+    @{ Src = "minisgl/message/frontend.py"; Dst = "message/frontend.py" },
     @{ Src = "minisgl/scheduler/utils.py"; Dst = "scheduler/utils.py" },
     @{ Src = "minisgl/scheduler/prefill.py"; Dst = "scheduler/prefill.py" },
     @{ Src = "minisgl/scheduler/scheduler.py"; Dst = "scheduler/scheduler.py" },
@@ -61,6 +63,8 @@ foreach ($f in $files) {
 Write-Host "Done. Files written:"
 Write-Host "  [NEW]  $pkg/scheduler/telemetry.py"
 Write-Host "  [NEW]  $pkg/scheduler/policies.py"
+Write-Host "  [MOD]  $pkg/message/__init__.py       (+ ResetMsg / ResetBackendMsg exports)"
+Write-Host "  [MOD]  $pkg/message/frontend.py       (+ cached_len/Q fields on UserReply)"
 Write-Host "  [MOD]  $pkg/scheduler/utils.py        (+ client_id, arrival_time on PendingReq)"
 Write-Host "  [MOD]  $pkg/scheduler/prefill.py      (+ policy dispatch + deficit update)"
 Write-Host "  [MOD]  $pkg/scheduler/scheduler.py    (+ telemetry recording + AIMD wiring)"

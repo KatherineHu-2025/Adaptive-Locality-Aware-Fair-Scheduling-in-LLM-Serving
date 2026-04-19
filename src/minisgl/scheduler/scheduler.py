@@ -220,6 +220,22 @@ class Scheduler(SchedulerIOMixin):
 
         reply: List[DetokenizeMsg] = []
         new_finished_reqs: Set[Req] = set()
+
+        jain_control_msg = self.telemetry.jain_fairness_index()
+        jain_prompt_msg = self.telemetry.jain_fairness_index_prompt()
+        p99_ttft_ms_msg = self.telemetry.p99_ttft() * 1000.0
+        aimd_violated_msg = False
+        aimd_violation_reason_msg = "none"
+        aimd_step_msg = -1
+        if self.controller is not None and self.controller.history:
+            last_aimd = self.controller.history[-1]
+            aimd_violated_msg = bool(last_aimd.get("violated", False))
+            aimd_violation_reason_msg = str(last_aimd.get("violation_reason", "none"))
+            try:
+                aimd_step_msg = int(last_aimd.get("step", -1))
+            except (TypeError, ValueError):
+                aimd_step_msg = -1
+
         with self.cache_manager.lazy_free_region():
             for i, req in enumerate(batch.reqs):
                 if isinstance(req, ChunkedReq):
@@ -230,7 +246,27 @@ class Scheduler(SchedulerIOMixin):
                 finished = not req.can_decode
                 if not req.sampling_params.ignore_eos:
                     finished |= next_token == self.eos_token_id
-                reply.append(DetokenizeMsg(uid=req.uid, next_token=next_token, finished=finished))
+
+                cached_len_msg = -1
+                q_at_sched_msg = -1.0
+                if req.uid in self._req_meta:
+                    _, _, _, cached_len_msg, q_at_sched_msg = self._req_meta[req.uid]
+
+                reply.append(
+                    DetokenizeMsg(
+                        uid=req.uid,
+                        next_token=next_token,
+                        finished=finished,
+                        cached_len=cached_len_msg,
+                        q_at_scheduling=q_at_sched_msg,
+                        jain_control=jain_control_msg,
+                        jain_prompt=jain_prompt_msg,
+                        p99_ttft_ms=p99_ttft_ms_msg,
+                        aimd_violated=aimd_violated_msg,
+                        aimd_violation_reason=aimd_violation_reason_msg,
+                        aimd_step=aimd_step_msg,
+                    )
+                )
 
                 # --- NEW: record first-token time on prefill completion ---
                 if batch.is_prefill and req.uid not in self._first_token_time:

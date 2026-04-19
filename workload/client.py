@@ -87,6 +87,9 @@ except ImportError:
     raise ImportError("pip install aiohttp")
 
 
+_STREAM_META_PREFIX = "__MINISGL_META__ "
+
+
 # ---------------------------------------------------------------------------
 # Per-request result
 # ---------------------------------------------------------------------------
@@ -107,6 +110,12 @@ class RequestResult:
     # Server-side fields (populated if server returns them; otherwise -1)
     cached_len: int = -1
     Q_at_scheduling: float = -1.0
+    jain_control: float = -1.0
+    jain_prompt: float = -1.0
+    p99_ttft_window_ms: float = -1.0
+    aimd_violated: bool = False
+    aimd_violation_reason: str = "none"
+    aimd_step: int = -1
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +212,14 @@ async def _send_one(
     first_token_time: Optional[float] = None
     last_token_time: Optional[float] = None
     output_tokens = 0
+    cached_len = -1
+    q_at_scheduling = -1.0
+    jain_control = -1.0
+    jain_prompt = -1.0
+    p99_ttft_window_ms = -1.0
+    aimd_violated = False
+    aimd_violation_reason = "none"
+    aimd_step = -1
     error = ""
 
     try:
@@ -222,7 +239,7 @@ async def _send_one(
                     error=f"HTTP {resp.status}: {body[:200]}",
                 )
 
-            # Parse SSE stream: each line is "data: <token>" or "data: [DONE]"
+            # Parse SSE stream: "data: <token>", "data: [DONE]", or metadata.
             async for raw_line in resp.content:
                 line = raw_line.decode("utf-8", errors="replace").strip()
                 if not line.startswith("data:"):
@@ -230,6 +247,23 @@ async def _send_one(
                 token = line[len("data:"):].strip()
                 if token == "[DONE]":
                     break
+
+                if token.startswith(_STREAM_META_PREFIX):
+                    try:
+                        meta_payload = json.loads(token[len(_STREAM_META_PREFIX):])
+                        cached_len = int(meta_payload.get("cached_len", -1))
+                        q_at_scheduling = float(meta_payload.get("Q_at_scheduling", -1.0))
+                        jain_control = float(meta_payload.get("jain_control", -1.0))
+                        jain_prompt = float(meta_payload.get("jain_prompt", -1.0))
+                        p99_ttft_window_ms = float(meta_payload.get("p99_ttft_ms", -1.0))
+                        aimd_violated = bool(meta_payload.get("aimd_violated", False))
+                        aimd_violation_reason = str(meta_payload.get("aimd_violation_reason", "none"))
+                        aimd_step = int(meta_payload.get("aimd_step", -1))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        # Ignore malformed metadata and keep sentinel defaults.
+                        pass
+                    continue
+
                 now = time.perf_counter()
                 if first_token_time is None:
                     first_token_time = now
@@ -260,6 +294,14 @@ async def _send_one(
         policy=policy,
         success=first_token_time is not None,
         error=error,
+        cached_len=cached_len,
+        Q_at_scheduling=q_at_scheduling,
+        jain_control=jain_control,
+        jain_prompt=jain_prompt,
+        p99_ttft_window_ms=p99_ttft_window_ms,
+        aimd_violated=aimd_violated,
+        aimd_violation_reason=aimd_violation_reason,
+        aimd_step=aimd_step,
     )
 
 
@@ -621,6 +663,8 @@ def _parse_args():
                    help="Maximum simultaneous in-flight requests")
     p.add_argument("--min-turns", type=int, default=1,
                    help="chatbot_arena only: skip conversations with fewer turns than this")
+    p.add_argument("--loogle-max-input-tokens", type=int, default=26000,
+                   help="loogle only: conservative estimated input-token cap; set <=0 to disable truncation")
     return p.parse_args()
 
 
@@ -638,7 +682,8 @@ async def _main():
         # one_per_doc=False: keep all QA pairs per document so that multiple
         # questions from the same doc share the long document prefix — matching
         # the paper's Long-Context QA workload (Fig. 6a: Long Doc → Q1A1, Q2A2, Q3A3).
-        specs = load_loogle(max_docs=args.max_reqs, one_per_doc=False)
+        loogle_cap = args.loogle_max_input_tokens if args.loogle_max_input_tokens > 0 else None
+        specs = load_loogle(max_docs=args.max_reqs, one_per_doc=False, max_input_tokens=loogle_cap)
     elif args.dataset == "chatbot_arena":
         from workload.dataset import load_chatbot_arena
         specs = load_chatbot_arena(max_conversations=args.max_reqs, min_turns=args.min_turns)
