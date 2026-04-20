@@ -377,7 +377,8 @@ Static DLPM tested at Q=4000 only (paper sweeps Q=500, 2000, 8000, 32000 — not
 
 Current progress update:
 - Earlier baseline coverage for all 4 policies exists (listed below).
-- Grid script fixed: no more exceeding context window, Loogle no longer times out.
+- Latest LooGLE refresh (`docs/plots/loogle_updated_benchmark_and_plot`) includes all 4 policies at `(rate=1.0, k=1.0)` for `n in {25,50}` with telemetry-enriched client logs.
+- Grid and dataset handling now avoid context-window overflow by truncating oversized LooGLE prompts before request dispatch.
 
 
 **Completed runs:**
@@ -388,7 +389,7 @@ Current progress update:
 | Chatbot Arena (min_turns=2) | dlpm (Q=4000) | 1.0 | `results/modal_grid_20260416_133620/` |
 | LooGLE (real weights) | adaptive_dlpm, lpm, fcfs | 1.0 | `results/loogle_real_weights_comparison/` |
 | LooGLE (real weights) | dlpm (Q=4000) | 1.0 | `results/modal_grid_20260416_134623/` |
-| LooGLE (metadata refresh) | adaptive_dlpm, lpm | 1.0 | `results/modal_grid_20260419_160306/runs/` |
+| LooGLE (metadata refresh) | adaptive_dlpm, lpm, fcfs, dlpm | 1.0 | `results/modal_grid_20260419_160306/runs/` |
 
 **Key findings so far:**
 - LPM causes severe cold-start starvation in Chatbot Arena (Turn-1 P99 = 37,926ms)
@@ -473,8 +474,13 @@ python run_aimd_ab_test_v2.py \
 | TTFT CDF + tail latency view (LooGLE) | ✅ | `docs/plots/loogle_real_weights/` |
 | Q over time with Jain overlay (AIMD sawtooth) | ✅ | `docs/plots/ab_test_realigned_jain/plot_relaxed_v2.png` |
 | Strict vs relaxed threshold A/B comparison | ✅ | `docs/plots/ab_test_realigned_jain/plot_ab_compare_v2.png` |
+| Updated LooGLE benchmark plot package (rate/K grid, TTFT histograms, AIMD overview) | ✅ | `docs/plots/loogle_updated_benchmark_and_plot/` |
+| Adaptive AIMD per-run trace set (all adaptive runs in folder) | ✅ | `docs/plots/loogle_updated_benchmark_and_plot/loogle_updated_benchmark_and_plot_aimd_traces/` |
+| LooGLE updated analysis summary markdown | ✅ | `docs/plots/loogle_updated_benchmark_and_plot/loogle_updated_benchmark_and_plot_analysis_summary.md` |
 | Pareto frontier (Throughput vs. Jain Index) | ❌ | Needs multi-Q sweep for static DLPM |
 | Per-client max wait time (starvation bar chart) | ❌ | Needs per-client breakdown from synthetic workload |
+
+**Note:** The Step 3.5 artifacts above are **interim diagnostic figures**, not the final result set we plan to include in the final writeup/presentation. The final figure set will be selected after the remaining high-load sweeps, static-DLPM multi-Q sweep, and AIMD hyperparameter tuning are complete.
 
 ---
 
@@ -483,16 +489,21 @@ python run_aimd_ab_test_v2.py \
 - ⚠️ Baseline runs done for Chatbot Arena + LooGLE at rate=1.0, all 4 policies
 - ❌ Multi-Q sweep for static DLPM not done
 - ⚠️ AIMD hyperparameter work is partially done (strict vs relaxed complete; full sweep pending)
-- ⚠️ Figures partially complete — TTFT/starvation + sawtooth plots done; pareto still pending
+- ⚠️ Figures for the latest LooGLE slice are complete (including adaptive per-run AIMD traces and TTFT comparison histograms); broader sweep and pareto figures still pending
 - ❌ Adaptive DLPM Pareto-dominance not yet demonstrated (needs higher-load, all-policy sweeps)
 
 ---
 
 ## 5. Week 4: Analysis and Writeup
 
-### Step 4.1 — Polish figures ❌
+### Step 4.1 — Polish figures ⚠️
 
 Use matplotlib or seaborn. Consistent colors, readable fonts (min 10pt), axis labels with units.
+
+Current progress:
+- Updated plotting pipeline now generates a consolidated LooGLE figure package with consistent TTFT histogram axis scaling and adaptive-only Q-over-time views.
+- Added one analysis summary markdown for the latest LooGLE run package.
+- Remaining work: finalize publication-ready styling and extend the same polish level to higher-load sweep outputs.
 
 ### Step 4.2 — Write the paper ❌
 
@@ -534,6 +545,7 @@ Structure (MLSys 2025 format):
 |---|---|---|
 | [run_modal_service.py](run_modal_service.py) | ✅ | Persistent Modal ASGI endpoint; proxies `/generate`, `/healthz`, `/aimd` |
 | [benchmark_modal_service_grid.py](benchmark_modal_service_grid.py) | ✅ | Grid benchmark driver: deploys per policy, sweeps rate/k/count, writes CSV+JSON summary |
+| [plot_benchmark_result.py](plot_benchmark_result.py) | ✅ | Generates extended benchmark visualization package (TTFT percentile/request histograms, adaptive AIMD overview, and per-run adaptive AIMD traces) |
 | [workload/client.py](workload/client.py) | ✅ | Parses streamed metadata and logs cached/Q/Jain/AIMD fields per request |
 | [workload/dataset.py](workload/dataset.py) | ✅ | Adds LooGLE prompt truncation (`max_input_tokens`) to reduce context-window drops |
 | [apply_patches.sh](apply_patches.sh) | ✅ | Updated patch copy list to include message schema files required for metadata plumbing |
@@ -699,7 +711,7 @@ Policy and AIMD knobs are set via environment variables in `run_modal.py` (or pa
 | mini SGLang's scheduler API differs from assumed structure | Medium | ✅ Resolved | Hook points verified; `reorder_pending_list` approach works cleanly |
 | OOM/errors from long LooGLE prompts | Medium | ⚠️ Partial | Added `max_input_tokens` truncation in loader to reduce context-window drops; still need controlled sensitivity sweep for truncation cap |
 | AIMD Q oscillates too fast / not at all | Medium | ⚠️ Active | AIMD never triggered at rate=1.0 req/s; needs higher load (≥2.0 req/s) to fire control interval |
-| Jain Index insensitive to starvation in our workload | Medium | ⚠️ Active | Client-side `cached_len` not returned by server; Jain identical across policies in current runs; need synthetic workload with repeated dominant/cold requests |
+| AIMD may over-tighten under strict fairness thresholds on LooGLE | Medium | ⚠️ Active | Latest refresh logs show high `aimd_violated` frequency dominated by `jain` reason; tune `AIMD_JAIN_THRESHOLD` and validate at higher rates |
 | Chatbot Arena traces don't have consistent client IDs | Low | ✅ Resolved | `question_id` used as `client_id`; `--min-turns` filter added to get multi-turn conversations |
 | Adaptive DLPM does not outperform best static Q | Low | ⚠️ Unresolved | At rate=1.0 FCFS wins; at high load DLPM advantage expected — experiments pending |
 | Static DLPM Q=4000 too small for LooGLE long-context prompts | — | 🆕 Discovered | P99=148s on LooGLE; need to either sweep Q values or use per-workload tuning as motivation for adaptive approach |
