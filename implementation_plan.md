@@ -379,6 +379,7 @@ Current progress update:
 - Earlier baseline coverage for all 4 policies exists (listed below).
 - Latest LooGLE refresh (`docs/plots/loogle_updated_benchmark_and_plot`) includes all 4 policies at `(rate=1.0, k=1.0)` for `n in {25,50}` with telemetry-enriched client logs.
 - Grid and dataset handling now avoid context-window overflow by truncating oversized LooGLE prompts before request dispatch.
+- Additional LooGLE threshold + concurrency runs completed (0.60/0.63/0.65 sweeps, concurrency 8/16, n=25/50/100) with dedicated plot packages.
 
 
 **Completed runs:**
@@ -390,6 +391,9 @@ Current progress update:
 | LooGLE (real weights) | adaptive_dlpm, lpm, fcfs | 1.0 | `results/loogle_real_weights_comparison/` |
 | LooGLE (real weights) | dlpm (Q=4000) | 1.0 | `results/modal_grid_20260416_134623/` |
 | LooGLE (metadata refresh) | adaptive_dlpm, lpm, fcfs, dlpm | 1.0 | `results/modal_grid_20260419_160306/runs/` |
+| LooGLE (J=0.65, concurrency=8) | adaptive_dlpm, lpm, fcfs, dlpm | 1.0 | `results/modal_grid_20260421_171114/` |
+| LooGLE (J=0.60) | adaptive_dlpm | 1.0 | `results/modal_grid_20260421_161221/` |
+| LooGLE (J=0.63, concurrency=16, n=25/50/100) | adaptive_dlpm, lpm, fcfs, dlpm | 1.0 | `results/modal_grid_20260421_185446/` |
 
 **Key findings so far:**
 - LPM causes severe cold-start starvation in Chatbot Arena (Turn-1 P99 = 37,926ms)
@@ -399,6 +403,7 @@ Current progress update:
 - AIMD never triggered (0 updates) — control interval requires deeper queue than current load produces
 
 **Remaining:** Multi-Q sweep for static DLPM; synthetic workload; rate sweep ≥ 2.0 req/s.
+**New open gaps:** static-Q sweep on LooGLE (Q=500/2000/8000/32000) and completion-time (not just TTFT) reporting.
 
 ---
 
