@@ -32,6 +32,42 @@ Conclusion to include: LooGLE validates robustness and failure modes in the cold
    - With max_concurrency=8, FCFS is the P99 winner at both n=25 and n=50; DLPM can blow up at n=50 (P99 >> 100k ms).
    - Adaptive remains competitive and avoids the worst DLPM failure.
 
+## Static DLPM Q Sweep vs Adaptive (Final LooGLE Run)
+
+Source: results/modal_grid_loogle_final_results/summary.csv (merged with modal_grid_20260421_185446 and the static Q sweep)
+
+All values are `rate=1.0, k=1.0`; Adaptive is J=0.63 (same run set as FCFS/LPM).
+
+### n=25
+
+| Policy | Q | Throughput (tok/s) | P50 (ms) | P99 (ms) |
+|---|---:|---:|---:|---:|
+| DLPM | 1000 | 8.17 | 13075.24 | 29679.21 |
+| DLPM | 2000 | 8.17 | 510.90 | 24205.37 |
+| DLPM | 4000 | 8.17 | 578.51 | 29347.32 |
+| DLPM | 8000 | 8.17 | 11711.60 | 168522.25 |
+| DLPM | 16000 | 8.17 | 550.20 | 23576.37 |
+| DLPM | 32000 | 8.17 | 1863.22 | 24080.49 |
+| Adaptive (J=0.63) | — | 8.17 | 573.04 | 18220.36 |
+
+Takeaway (n=25): best static P99 is DLPM Q=16000 (23576 ms), but Adaptive (18220 ms) is still better on P99 by ~29%. Static Q is highly unstable across values (e.g., Q=8000 is catastrophic).
+
+### n=50
+
+| Policy | Q | Throughput (tok/s) | P50 (ms) | P99 (ms) |
+|---|---:|---:|---:|---:|
+| DLPM | 1000 | 9.22 | 3964.12 | 15883.49 |
+| DLPM | 2000 | 9.22 | 630.47 | 2885.95 |
+| DLPM | 4000 | 9.22 | 941.44 | 57694.08 |
+| DLPM | 8000 | 9.22 | 1534.70 | 151516.06 |
+| DLPM | 16000 | 9.22 | 645.40 | 2888.50 |
+| DLPM | 32000 | 9.22 | 1301.18 | 12103.15 |
+| Adaptive (J=0.63) | — | 9.22 | 698.13 | 3274.94 |
+
+Takeaway (n=50): best static P99 is DLPM Q=2000 (2885 ms), beating Adaptive (3275 ms) by ~11.9% while keeping throughput identical. Static Q performance is highly sensitive and no single Q dominates both n=25 and n=50.
+
+**Overall message:** static DLPM can beat Adaptive at a specific Q and n, but it is brittle; Adaptive provides more stable tail behavior across n and avoids catastrophic failures seen at other Q values.
+
 ## What Plots/Data to Include in the Paper
 
 ### Must-Include LooGLE Figures
@@ -86,8 +122,9 @@ If you want a stronger "wins P50, loses P99" narrative, LooGLE alone is not idea
 
 These are high-value experiments that are missing or incomplete:
 
-1. **Static Q sweep on LooGLE (Q=500/2000/8000/32000)**
-   - Needed to show the best static frontier and position adaptive relative to it.
+1. **Static Q sweep on LooGLE (Q=1000/2000/4000/8000/16000/32000)**
+   - Completed at rate=1.0, k=1.0, n=25/50 under concurrency=16.
+   - Use this sweep to identify the best static frontier and position adaptive relative to it.
 
 2. **Higher load runs (rate=2.0/3.0) with concurrency ≥ 8**
    - Needed to show adaptive behavior under deeper queues.
@@ -109,6 +146,10 @@ These are high-value experiments that are missing or incomplete:
 - LooGLE 0.63, concurrency=16, n=25/50/100:
   - results/modal_grid_20260421_185446
   - docs/plots/loogle_63p_jain_concurrency_16/
+
+- LooGLE static Q sweep (final merged set, includes adaptive + baselines + dlpm_q*):
+   - results/modal_grid_loogle_final_results/
+   - docs/results/loogle_final_results/
 
 - LooGLE 0.65, concurrency=8, n=25/50:
   - results/modal_grid_20260421_171114
