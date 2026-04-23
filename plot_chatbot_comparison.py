@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -291,6 +293,156 @@ def fig4_jain(rows: list[dict], out_path: Path, dpi: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Turn-level helpers
+# ---------------------------------------------------------------------------
+
+def load_jsonl_runs(folder: Path) -> list[dict]:
+    """Load all per-request rows from runs/*.jsonl, adding 'turn' and fixed 'policy' fields."""
+    runs_dir = folder / "runs"
+    if not runs_dir.exists():
+        return []
+
+    all_rows: list[dict] = []
+    for f in sorted(runs_dir.glob("*.jsonl")):
+        rows = [json.loads(l) for l in f.read_text().splitlines() if l.strip()]
+        if not rows:
+            continue
+
+        # Derive policy label from filename (same logic as fix_policy_label)
+        stem = f.stem  # e.g. dlpm_q1200_r0.5_k1.0_n100
+        m = re.match(r"(adaptive_dlpm|dlpm_q\d+|dlpm|lpm|fcfs)", stem)
+        policy = m.group(1) if m else stem.split("_r")[0]
+        # Normalise dlpm_qXXXX -> dlpm_qXXXX (already fine), plain dlpm stays dlpm
+        # extract rate and k from filename
+        rm = re.search(r"_r([\d.]+)_k([\d.]+)", stem)
+        rate = float(rm.group(1)) if rm else float("nan")
+        k = float(rm.group(2)) if rm else float("nan")
+
+        # Assign turn number within each client_id by sorting on arrival_time
+        by_client: dict[str, list[dict]] = defaultdict(list)
+        for r in rows:
+            by_client[r["client_id"]].append(r)
+
+        for r in rows:
+            r["_policy"] = policy
+            r["_rate"] = rate
+            r["_k"] = k
+
+        for turns in by_client.values():
+            turns.sort(key=lambda r: r["arrival_time"])
+            for i, r in enumerate(turns):
+                r["_turn"] = i + 1
+
+        all_rows.extend(rows)
+
+    return all_rows
+
+
+def _percentile(vals: list[float], p: float) -> float:
+    if not vals:
+        return float("nan")
+    s = sorted(vals)
+    idx = int(len(s) * p)
+    return s[min(idx, len(s) - 1)]
+
+
+# ---------------------------------------------------------------------------
+# Figure 5: TTFT by turn number per policy
+# ---------------------------------------------------------------------------
+
+def fig5_ttft_by_turn(req_rows: list[dict], out_path: Path, dpi: int) -> None:
+    policies = _sort_policies(list({r["_policy"] for r in req_rows}))
+    max_turn = max((r["_turn"] for r in req_rows), default=1)
+    turns = list(range(1, min(max_turn, 6) + 1))  # cap at turn 6 for readability
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), dpi=dpi)
+
+    for ax, pct, label in [(axes[0], 0.50, "P50"), (axes[1], 0.99, "P99")]:
+        bar_w = 0.8 / len(policies)
+        centers = np.arange(len(turns))
+        offsets = np.linspace(-(len(policies) - 1) / 2, (len(policies) - 1) / 2, len(policies)) * bar_w
+
+        for pi, policy in enumerate(policies):
+            vals = []
+            for t in turns:
+                ttfts = [r["ttft_ms"] for r in req_rows
+                         if r["_policy"] == policy and r["_turn"] == t and r.get("success")]
+                vals.append(_percentile(ttfts, pct))
+            ax.bar(
+                centers + offsets[pi], vals, width=bar_w,
+                color=POLICY_COLORS.get(policy, "tab:gray"),
+                label=POLICY_LABELS.get(policy, policy),
+                alpha=0.88,
+            )
+
+        ax.set_xticks(centers)
+        ax.set_xticklabels([f"Turn {t}" for t in turns])
+        ax.set_ylabel("TTFT (ms)")
+        ax.set_title(f"TTFT {label} by Turn Number")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_ylim(bottom=0)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=min(6, len(policies)), frameon=True, fontsize=9)
+    fig.suptitle("Chatbot Arena — TTFT by Turn (all conditions pooled)", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.88])
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig5] {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# Figure 6: Turn-1 starvation — P99 TTFT per policy and load condition
+# ---------------------------------------------------------------------------
+
+def fig6_turn1_starvation(req_rows: list[dict], out_path: Path, dpi: int) -> None:
+    policies = _sort_policies(list({r["_policy"] for r in req_rows}))
+    conditions = sorted({(r["_rate"], r["_k"]) for r in req_rows})
+    bar_w = 0.8 / len(policies)
+    centers = np.arange(len(conditions))
+    offsets = np.linspace(-(len(policies) - 1) / 2, (len(policies) - 1) / 2, len(policies)) * bar_w
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), dpi=dpi)
+
+    for ax, turn_filter, title in [
+        (axes[0], 1, "Turn-1 TTFT P99 (cold-start requests)"),
+        (axes[1], None, "Turn-2+ TTFT P99 (warm requests)"),
+    ]:
+        for pi, policy in enumerate(policies):
+            vals = []
+            for rate, k in conditions:
+                ttfts = [
+                    r["ttft_ms"] for r in req_rows
+                    if r["_policy"] == policy
+                    and r["_rate"] == rate and r["_k"] == k
+                    and r.get("success")
+                    and (r["_turn"] == 1 if turn_filter == 1 else r["_turn"] > 1)
+                ]
+                vals.append(_percentile(ttfts, 0.99))
+            ax.bar(
+                centers + offsets[pi], vals, width=bar_w,
+                color=POLICY_COLORS.get(policy, "tab:gray"),
+                label=POLICY_LABELS.get(policy, policy),
+                alpha=0.88,
+            )
+
+        ax.set_xticks(centers)
+        ax.set_xticklabels([f"rate={r:.1f}\nk={k:.1f}" for r, k in conditions], fontsize=9)
+        ax.set_ylabel("TTFT P99 (ms)")
+        ax.set_title(title)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.set_ylim(bottom=0)
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=min(6, len(policies)), frameon=True, fontsize=9)
+    fig.suptitle("Chatbot Arena — Turn-1 (cold) vs Turn-2+ (warm) Starvation", fontsize=13)
+    fig.tight_layout(rect=[0, 0, 1, 0.88])
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[fig6] {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -318,6 +470,14 @@ def main() -> int:
     fig2_tail_scatter(rows, out_dir / f"{prefix}_fig2_tail_scatter.png", args.dpi)
     fig3_throughput(rows, out_dir / f"{prefix}_fig3_throughput.png", args.dpi)
     fig4_jain(rows, out_dir / f"{prefix}_fig4_jain.png", args.dpi)
+
+    req_rows = load_jsonl_runs(folder)
+    if req_rows:
+        print(f"[load] {len(req_rows)} request rows from runs/")
+        fig5_ttft_by_turn(req_rows, out_dir / f"{prefix}_fig5_ttft_by_turn.png", args.dpi)
+        fig6_turn1_starvation(req_rows, out_dir / f"{prefix}_fig6_turn1_starvation.png", args.dpi)
+    else:
+        print("[skip] no runs/ directory found, skipping fig5/fig6")
 
     print("\n=== Done ===")
     print(f"Output: {out_dir}/")
