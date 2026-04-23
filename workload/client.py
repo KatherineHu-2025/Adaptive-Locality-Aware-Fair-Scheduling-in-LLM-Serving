@@ -79,7 +79,7 @@ import numpy as np
 # Make workload/ importable when running as __main__
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from workload.dataset import RequestSpec, load_loogle, load_synthetic
+from workload.dataset import RequestSpec, load_loogle, load_loogle_prefix_mix, load_synthetic
 
 try:
     import aiohttp
@@ -106,6 +106,7 @@ class RequestResult:
     expected_output_len: int
     policy: str
     success: bool
+    request_total_ms: float = -1.0  # submit -> final token (includes queue + decode tail)
     error: str = ""
     # Server-side fields (populated if server returns them; otherwise -1)
     cached_len: int = -1
@@ -281,6 +282,8 @@ async def _send_one(
 
     ttft_ms = (ft - (t0 + arrival)) * 1000.0
     tpot_ms = ((lt - ft) / max(output_tokens - 1, 1)) * 1000.0 if output_tokens > 1 else -1.0
+    decode_tail_ms = max(output_tokens - 1, 0) * max(tpot_ms, 0.0)
+    request_total_ms = ttft_ms + decode_tail_ms if first_token_time else -1.0
 
     return RequestResult(
         req_id=req_id,
@@ -293,6 +296,7 @@ async def _send_one(
         expected_output_len=spec.expected_output_len,
         policy=policy,
         success=first_token_time is not None,
+        request_total_ms=request_total_ms,
         error=error,
         cached_len=cached_len,
         Q_at_scheduling=q_at_scheduling,
@@ -631,7 +635,7 @@ def print_summary(results: List[RequestResult]) -> None:
 def _parse_args():
     p = argparse.ArgumentParser(description="Replay workload against mini-sglang")
     p.add_argument("--server",  default="http://127.0.0.1:19190")
-    p.add_argument("--dataset", choices=["synthetic", "loogle", "chatbot_arena"],
+    p.add_argument("--dataset", choices=["synthetic", "loogle", "loogle_prefix", "chatbot_arena"],
                    default="synthetic")
     p.add_argument("--arrival-mode", choices=["global", "per-client", "sequential"], default="global",
                    help=(
@@ -665,6 +669,16 @@ def _parse_args():
                    help="chatbot_arena only: skip conversations with fewer turns than this")
     p.add_argument("--loogle-max-input-tokens", type=int, default=26000,
                    help="loogle only: conservative estimated input-token cap; set <=0 to disable truncation")
+    p.add_argument("--loogle-prefix-max-docs", type=int, default=500,
+                   help="loogle_prefix only: cap on distinct docs to sample from")
+    p.add_argument("--loogle-prefix-dominant-client-id", default="client_dominant",
+                   help="loogle_prefix only: client_id used for repeated dominant-context requests")
+    p.add_argument("--loogle-prefix-cold-client-prefix", default="client_cold",
+                   help="loogle_prefix only: prefix for fresh-context cold client IDs")
+    p.add_argument("--loogle-prefix-mix-mode", choices=["interleave", "random", "chunked"], default="interleave",
+                   help="loogle_prefix only: request ordering strategy for dominant/cold mix")
+    p.add_argument("--loogle-prefix-chunk-size", type=int, default=20,
+                   help="loogle_prefix only: chunk size used when mix mode is 'chunked'")
     return p.parse_args()
 
 
@@ -684,6 +698,19 @@ async def _main():
         # the paper's Long-Context QA workload (Fig. 6a: Long Doc → Q1A1, Q2A2, Q3A3).
         loogle_cap = args.loogle_max_input_tokens if args.loogle_max_input_tokens > 0 else None
         specs = load_loogle(max_docs=args.max_reqs, one_per_doc=False, max_input_tokens=loogle_cap)
+    elif args.dataset == "loogle_prefix":
+        loogle_cap = args.loogle_max_input_tokens if args.loogle_max_input_tokens > 0 else None
+        specs = load_loogle_prefix_mix(
+            dominant_reqs=args.dominant_reqs,
+            cold_reqs=args.cold_reqs,
+            dominant_client_id=args.loogle_prefix_dominant_client_id,
+            cold_client_prefix=args.loogle_prefix_cold_client_prefix,
+            max_docs=args.loogle_prefix_max_docs,
+            max_input_tokens=loogle_cap,
+            mix_mode=args.loogle_prefix_mix_mode,
+            chunk_size=args.loogle_prefix_chunk_size,
+            seed=args.seed,
+        )
     elif args.dataset == "chatbot_arena":
         from workload.dataset import load_chatbot_arena
         specs = load_chatbot_arena(max_conversations=args.max_reqs, min_turns=args.min_turns)

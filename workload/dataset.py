@@ -29,6 +29,7 @@ Usage
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import random
 from typing import Callable, List, Optional
 
 
@@ -389,6 +390,228 @@ def load_loogle(
         )
 
     return specs
+
+
+def load_loogle_prefix_mix(
+    config: str = "longdep_qa",
+    split: str = "test",
+    dominant_reqs: int = 80,
+    cold_reqs: int = 20,
+    dominant_client_id: str = "client_dominant",
+    cold_client_prefix: str = "client_cold",
+    max_docs: Optional[int] = 500,
+    max_input_tokens: Optional[int] = 26000,
+    mix_mode: str = "interleave",
+    chunk_size: int = 20,
+    seed: int = 42,
+    token_len_fn: Callable[[str], int] = _word_count_estimator,
+) -> List[RequestSpec]:
+    """
+    Build a prefix-heavy LooGLE workload with one dominant client and many
+    cold/new-context clients.
+
+    dominant client
+        Sends `dominant_reqs` requests that all share the SAME long document
+        context (maximizing prefix reuse). Questions are cycled over the QA
+        pairs available for that document and repeated if needed.
+
+    cold clients
+        Send `cold_reqs` requests from DIFFERENT documents/contexts. Each cold
+        request uses its own client_id so there is no cross-request reuse.
+
+    This scenario is intentionally favorable to prefix matching and is useful
+    as a counterpart to starvation-focused workloads.
+    """
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        raise ImportError("pip install datasets")
+
+    ds = load_dataset("bigai-nlco/LooGLE", config, split=split)
+
+    by_doc: dict[str, list[dict]] = {}
+    for ex in ds:
+        doc_id: str = ex["doc_id"]
+        if doc_id not in by_doc:
+            if max_docs is not None and len(by_doc) >= max_docs:
+                continue
+            by_doc[doc_id] = []
+        by_doc[doc_id].append(ex)
+
+    if not by_doc:
+        return []
+
+    rng = random.Random(seed)
+
+    # Pick the doc with most QA pairs so dominant requests can vary question text
+    # while keeping the same long context prefix.
+    dominant_doc_id, dominant_rows = max(by_doc.items(), key=lambda kv: len(kv[1]))
+    dominant_context: str = str(dominant_rows[0]["context"])
+    dominant_qas: list[tuple[str, str]] = [
+        (str(r["question"]), str(r["answer"]))
+        for r in dominant_rows
+        if r.get("question") is not None and r.get("answer") is not None
+    ]
+    if not dominant_qas:
+        return []
+    rng.shuffle(dominant_qas)
+
+    def _build_prompt(context: str, question: str) -> tuple[str, bool]:
+        question_suffix = f"\n\nQuestion: {question}"
+        prompt = f"{context}{question_suffix}"
+        if max_input_tokens is None or token_len_fn(prompt) <= max_input_tokens:
+            return prompt, False
+
+        # Keep the front of the document so shared-prefix behavior is preserved.
+        context_words = context.split()
+        lo, hi = 0, len(context_words)
+        best = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate_context = " ".join(context_words[:mid])
+            candidate_prompt = f"{candidate_context}{question_suffix}"
+            if token_len_fn(candidate_prompt) <= max_input_tokens:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        truncated_prompt = f"{' '.join(context_words[:best])}{question_suffix}"
+        return truncated_prompt, True
+
+    dominant_specs: list[RequestSpec] = []
+    truncated_count = 0
+    for i in range(max(0, dominant_reqs)):
+        q, a = dominant_qas[i % len(dominant_qas)]
+        prompt, truncated = _build_prompt(dominant_context, q)
+        if truncated:
+            truncated_count += 1
+        dominant_specs.append(
+            RequestSpec(
+                client_id=dominant_client_id,
+                prompt=prompt,
+                expected_output_len=max(token_len_fn(a), 8),
+                arrival_time=0.0,
+            )
+        )
+
+    cold_pool: list[tuple[str, dict]] = []
+    for doc_id, rows in by_doc.items():
+        if doc_id == dominant_doc_id:
+            continue
+        if rows:
+            # One QA per doc to keep cold requests on fresh contexts.
+            cold_pool.append((doc_id, rows[0]))
+
+    if not cold_pool and cold_reqs > 0:
+        # Fallback: if only one doc was loaded, use the dominant doc but assign
+        # unique cold client IDs so they still contend as separate clients.
+        cold_pool = [(dominant_doc_id, r) for r in dominant_rows]
+
+    rng.shuffle(cold_pool)
+    cold_specs: list[RequestSpec] = []
+    for i in range(max(0, cold_reqs)):
+        _, ex = cold_pool[i % len(cold_pool)]
+        context = str(ex["context"])
+        question = str(ex["question"])
+        answer = str(ex["answer"])
+        prompt, truncated = _build_prompt(context, question)
+        if truncated:
+            truncated_count += 1
+        cold_specs.append(
+            RequestSpec(
+                client_id=f"{cold_client_prefix}_{i:04d}",
+                prompt=prompt,
+                expected_output_len=max(token_len_fn(answer), 8),
+                arrival_time=0.0,
+            )
+        )
+
+    # Mix dominant/cold requests according to the requested strategy.
+    # interleave: alternate while both lists have items, then append leftovers.
+    # random: weighted random ordering while preserving exact counts.
+    # chunked: preserve dominant/cold ratio per fixed-size window.
+    mixed: list[RequestSpec] = []
+    mode = (mix_mode or "interleave").strip().lower()
+    if mode == "interleave":
+        for d, c in zip(dominant_specs, cold_specs):
+            mixed.append(d)
+            mixed.append(c)
+        mixed.extend(dominant_specs[len(cold_specs):])
+        mixed.extend(cold_specs[len(dominant_specs):])
+    elif mode == "random":
+        dom_pool = list(dominant_specs)
+        cold_pool = list(cold_specs)
+        rng.shuffle(dom_pool)
+        rng.shuffle(cold_pool)
+        dom_idx = 0
+        cold_idx = 0
+        dom_left = len(dom_pool)
+        cold_left = len(cold_pool)
+        while dom_left + cold_left > 0:
+            if dom_left == 0:
+                mixed.append(cold_pool[cold_idx])
+                cold_idx += 1
+                cold_left -= 1
+                continue
+            if cold_left == 0:
+                mixed.append(dom_pool[dom_idx])
+                dom_idx += 1
+                dom_left -= 1
+                continue
+            p_dom = dom_left / float(dom_left + cold_left)
+            if rng.random() < p_dom:
+                mixed.append(dom_pool[dom_idx])
+                dom_idx += 1
+                dom_left -= 1
+            else:
+                mixed.append(cold_pool[cold_idx])
+                cold_idx += 1
+                cold_left -= 1
+    elif mode == "chunked":
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0 for loogle_prefix chunked mix mode")
+        dom_pool = list(dominant_specs)
+        cold_pool = list(cold_specs)
+        rng.shuffle(dom_pool)
+        rng.shuffle(cold_pool)
+        dom_idx = 0
+        cold_idx = 0
+        total_reqs = len(dom_pool) + len(cold_pool)
+        dom_ratio = len(dom_pool) / float(total_reqs) if total_reqs > 0 else 0.0
+        while dom_idx < len(dom_pool) or cold_idx < len(cold_pool):
+            dom_left = len(dom_pool) - dom_idx
+            cold_left = len(cold_pool) - cold_idx
+            this_chunk = min(chunk_size, dom_left + cold_left)
+            if this_chunk <= 0:
+                break
+            dom_in_chunk = min(dom_left, int(round(this_chunk * dom_ratio)))
+            cold_in_chunk = min(cold_left, this_chunk - dom_in_chunk)
+            # Fill any shortfall due to rounding/clamping.
+            missing = this_chunk - (dom_in_chunk + cold_in_chunk)
+            if missing > 0 and dom_left - dom_in_chunk > 0:
+                take = min(missing, dom_left - dom_in_chunk)
+                dom_in_chunk += take
+                missing -= take
+            if missing > 0 and cold_left - cold_in_chunk > 0:
+                take = min(missing, cold_left - cold_in_chunk)
+                cold_in_chunk += take
+            chunk: list[RequestSpec] = []
+            chunk.extend(dom_pool[dom_idx: dom_idx + dom_in_chunk])
+            chunk.extend(cold_pool[cold_idx: cold_idx + cold_in_chunk])
+            rng.shuffle(chunk)
+            mixed.extend(chunk)
+            dom_idx += dom_in_chunk
+            cold_idx += cold_in_chunk
+    else:
+        raise ValueError(f"Unknown loogle_prefix mix_mode: {mix_mode}")
+
+    if truncated_count > 0:
+        print(
+            f"[load_loogle_prefix_mix] Truncated {truncated_count} prompts "
+            f"to max_input_tokens={max_input_tokens}"
+        )
+
+    return mixed
 
 
 _COLD_TOPICS = [

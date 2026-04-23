@@ -10,6 +10,7 @@ What this script does:
 Dataset behavior:
 - synthetic: request_count is split into dominant/cold by --cold-fraction.
 - loogle/chatbot_arena: request_count is passed as --max-reqs to workload.client.
+- loogle_prefix: request_count is split into dominant/cold by --loogle-prefix-dominant-fraction.
 
 Example:
     python benchmark_modal_service_grid.py \
@@ -187,6 +188,39 @@ def wait_for_health(base_url: str, timeout_sec: int = 600) -> dict[str, Any]:
     raise RuntimeError(f"Health check timed out for {url}. Last error: {last_err}")
 
 
+def reset_experiment_state(base_url: str, timeout_sec: float = 60.0, attempts: int = 3) -> dict[str, Any]:
+    """Reset service-side scheduler experiment state so each run starts clean."""
+    url = f"{base_url.rstrip('/')}/reset_experiment"
+    payload = json.dumps({"scope": "experiment"}).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    last_err: str | None = None
+
+    for attempt in range(1, max(1, attempts) + 1):
+        try:
+            req = urlrequest.Request(url, data=payload, headers=headers, method="POST")
+            with urlrequest.urlopen(req, timeout=timeout_sec) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(body) if body else {}
+                if isinstance(data, dict) and data.get("ok", True):
+                    return data
+                last_err = f"reset ok=false: {data}"
+        except urlerror.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+            if exc.code == 404:
+                raise RuntimeError(
+                    "Server does not expose /reset_experiment (HTTP 404). "
+                    "Redeploy using the current run_modal_service.py before benchmarking."
+                ) from exc
+            last_err = f"HTTP {exc.code}: {body[:300]}"
+        except (urlerror.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            last_err = str(exc)
+
+        if attempt < attempts:
+            time.sleep(1.0)
+
+    raise RuntimeError(f"Failed to reset experiment state via {url}. Last error: {last_err}")
+
+
 def percentile(sorted_values: list[float], p: float) -> float:
     if not sorted_values:
         return float("nan")
@@ -203,6 +237,7 @@ def summarize_jsonl(
     request_count: int,
     dominant: int,
     cold: int,
+    dominant_client_prefix: str = "client_dominant",
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8") as f:
@@ -215,6 +250,39 @@ def summarize_jsonl(
     failed = [r for r in rows if not r.get("success")]
 
     ttfts = sorted(float(r["ttft_ms"]) for r in success if float(r.get("ttft_ms", -1)) >= 0)
+    request_total_ms = sorted(
+        float(r.get("request_total_ms", -1.0))
+        for r in success
+        if float(r.get("request_total_ms", -1.0)) >= 0
+    )
+    # Backward-compatible fallback for older logs that do not include request_total_ms.
+    if not request_total_ms:
+        request_total_ms = sorted(
+            float(r.get("ttft_ms", -1.0))
+            + max(int(r.get("output_tokens", 0)) - 1, 0) * max(float(r.get("tpot_ms", -1.0)), 0.0)
+            for r in success
+            if float(r.get("ttft_ms", -1.0)) >= 0
+        )
+
+    dominant_success = [
+        r for r in success if str(r.get("client_id", "")).startswith(dominant_client_prefix)
+    ] if dominant_client_prefix else []
+    dominant_ttfts = sorted(
+        float(r.get("ttft_ms", -1.0)) for r in dominant_success if float(r.get("ttft_ms", -1.0)) >= 0
+    )
+    dominant_request_total_ms = sorted(
+        float(r.get("request_total_ms", -1.0))
+        for r in dominant_success
+        if float(r.get("request_total_ms", -1.0)) >= 0
+    )
+    if not dominant_request_total_ms:
+        dominant_request_total_ms = sorted(
+            float(r.get("ttft_ms", -1.0))
+            + max(int(r.get("output_tokens", 0)) - 1, 0) * max(float(r.get("tpot_ms", -1.0)), 0.0)
+            for r in dominant_success
+            if float(r.get("ttft_ms", -1.0)) >= 0
+        )
+
     total_wall = max((float(r.get("arrival_time", 0.0)) for r in rows), default=0.0)
     total_tokens = sum(int(r.get("output_tokens", 0)) for r in success)
 
@@ -304,6 +372,16 @@ def summarize_jsonl(
         "ttft_p95_ms": percentile(ttfts, 0.95),
         "ttft_p99_ms": percentile(ttfts, 0.99),
         "ttft_mean_ms": statistics.fmean(ttfts) if ttfts else float("nan"),
+        "request_total_p50_ms": percentile(request_total_ms, 0.50),
+        "request_total_p95_ms": percentile(request_total_ms, 0.95),
+        "request_total_p99_ms": percentile(request_total_ms, 0.99),
+        "request_total_mean_ms": statistics.fmean(request_total_ms) if request_total_ms else float("nan"),
+        "dominant_client_prefix": dominant_client_prefix,
+        "dominant_success_count": len(dominant_success),
+        "dominant_ttft_p50_ms": percentile(dominant_ttfts, 0.50),
+        "dominant_ttft_p99_ms": percentile(dominant_ttfts, 0.99),
+        "dominant_request_total_p50_ms": percentile(dominant_request_total_ms, 0.50),
+        "dominant_request_total_p99_ms": percentile(dominant_request_total_ms, 0.99),
         "jain_index": jain,                   # paper metric, all requests
         "jain_index_active": jain_active,     # paper metric, active window only
         "jain_output_tokens": jain_output,    # output-only, all requests
@@ -323,6 +401,7 @@ def make_failed_row(
     cold: int,
     output_file: Path,
     run_error: str,
+    dominant_client_prefix: str = "client_dominant",
 ) -> dict[str, Any]:
     """Return a consistent summary row for workload runs that failed before JSONL output was written."""
     return {
@@ -343,6 +422,16 @@ def make_failed_row(
         "ttft_p95_ms": float("nan"),
         "ttft_p99_ms": float("nan"),
         "ttft_mean_ms": float("nan"),
+        "request_total_p50_ms": float("nan"),
+        "request_total_p95_ms": float("nan"),
+        "request_total_p99_ms": float("nan"),
+        "request_total_mean_ms": float("nan"),
+        "dominant_client_prefix": dominant_client_prefix,
+        "dominant_success_count": 0,
+        "dominant_ttft_p50_ms": float("nan"),
+        "dominant_ttft_p99_ms": float("nan"),
+        "dominant_request_total_p50_ms": float("nan"),
+        "dominant_request_total_p99_ms": float("nan"),
         "jain_index": float("nan"),
         "jain_index_active": float("nan"),
         "jain_output_tokens": float("nan"),
@@ -357,6 +446,17 @@ def format_run_error(res: subprocess.CompletedProcess[str], tail_chars: int = 40
     if not combined:
         return "workload.client failed with no stdout/stderr output"
     return safe_for_console(combined[-tail_chars:])
+
+
+def dominant_summary_suffix(row: dict[str, Any]) -> str:
+    parts: list[str] = []
+    dom_ttft = row.get("dominant_ttft_p50_ms", float("nan"))
+    dom_total = row.get("dominant_request_total_p50_ms", float("nan"))
+    if isinstance(dom_ttft, (int, float)) and not math.isnan(float(dom_ttft)):
+        parts.append(f"dom_ttft_p50={float(dom_ttft):.1f}ms")
+    if isinstance(dom_total, (int, float)) and not math.isnan(float(dom_total)):
+        parts.append(f"dom_e2e_p50={float(dom_total):.1f}ms")
+    return (" " + " ".join(parts)) if parts else ""
 
 
 def stop_service(service_name: str) -> None:
@@ -382,6 +482,12 @@ def run_client_once(
     min_turns: int = 1,
     num_dominant_clients: int = 1,
     num_cold_clients: int = 1,
+    loogle_max_input_tokens: int = 26000,
+    loogle_prefix_max_docs: int = 500,
+    loogle_prefix_dominant_client_id: str = "client_dominant",
+    loogle_prefix_cold_client_prefix: str = "client_cold",
+    loogle_prefix_mix_mode: str = "interleave",
+    loogle_prefix_chunk_size: int = 20,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
@@ -411,16 +517,40 @@ def run_client_once(
         str(out_file),
     ]
 
-    if dataset == "synthetic":
+    if dataset in ("synthetic", "loogle_prefix"):
         cmd.extend([
             "--dominant-reqs",
             str(dominant_reqs),
             "--cold-reqs",
             str(cold_reqs),
+        ])
+
+    if dataset == "synthetic":
+        cmd.extend([
             "--num-dominant-clients",
             str(num_dominant_clients),
             "--num-cold-clients",
             str(num_cold_clients),
+        ])
+
+    if dataset in ("loogle", "loogle_prefix"):
+        cmd.extend([
+            "--loogle-max-input-tokens",
+            str(loogle_max_input_tokens),
+        ])
+
+    if dataset == "loogle_prefix":
+        cmd.extend([
+            "--loogle-prefix-max-docs",
+            str(loogle_prefix_max_docs),
+            "--loogle-prefix-dominant-client-id",
+            loogle_prefix_dominant_client_id,
+            "--loogle-prefix-cold-client-prefix",
+            loogle_prefix_cold_client_prefix,
+            "--loogle-prefix-mix-mode",
+            loogle_prefix_mix_mode,
+            "--loogle-prefix-chunk-size",
+            str(loogle_prefix_chunk_size),
         ])
 
     if dataset == "chatbot_arena" and min_turns > 1:
@@ -457,7 +587,7 @@ def main() -> int:
     parser.add_argument("--request-counts", default="25,50")
     parser.add_argument(
         "--dataset",
-        choices=["synthetic", "loogle", "chatbot_arena"],
+        choices=["synthetic", "loogle", "loogle_prefix", "chatbot_arena"],
         default="synthetic",
         help=(
             "Workload dataset for workload.client. "
@@ -465,6 +595,20 @@ def main() -> int:
         ),
     )
     parser.add_argument("--cold-fraction", type=float, default=0.2)
+    parser.add_argument("--loogle-prefix-dominant-fraction", type=float, default=0.8,
+                        help="loogle_prefix only: fraction of requests assigned to dominant repeated-context client")
+    parser.add_argument("--loogle-max-input-tokens", type=int, default=26000,
+                        help="loogle/loogle_prefix: conservative estimated input-token cap; set <=0 to disable truncation")
+    parser.add_argument("--loogle-prefix-max-docs", type=int, default=500,
+                        help="loogle_prefix only: cap on distinct docs sampled from LooGLE")
+    parser.add_argument("--dominant-client-prefix", default="client_dominant",
+                        help="Prefix used to identify dominant client rows in summary metrics")
+    parser.add_argument("--loogle-prefix-cold-client-prefix", default="client_cold",
+                        help="loogle_prefix only: client ID prefix for cold/new-context requests")
+    parser.add_argument("--loogle-prefix-mix-mode", choices=["interleave", "random", "chunked"], default="interleave",
+                        help="loogle_prefix only: request ordering strategy for dominant/cold mix")
+    parser.add_argument("--loogle-prefix-chunk-size", type=int, default=20,
+                        help="loogle_prefix only: chunk size used when mix mode is 'chunked'")
     parser.add_argument("--arrival-mode", choices=["global", "per-client", "sequential"], default="per-client")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--max-concurrency", type=int, default=2)
@@ -556,11 +700,16 @@ def main() -> int:
                     cold = int(round(req_count * args.cold_fraction))
                     cold = min(max(cold, 1), req_count - 1)
                     dominant = req_count - cold
+                elif args.dataset == "loogle_prefix":
+                    dominant = int(round(req_count * args.loogle_prefix_dominant_fraction))
+                    dominant = min(max(dominant, 1), req_count - 1)
+                    cold = req_count - dominant
                 else:
                     cold = 0
                     dominant = 0
 
                 out_file = run_dir / f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
+                reset_experiment_state(base_url)
                 res = run_client_once(
                     base_url=base_url,
                     policy=policy,
@@ -578,6 +727,12 @@ def main() -> int:
                     min_turns=args.min_turns,
                     num_dominant_clients=args.num_dominant_clients,
                     num_cold_clients=args.num_cold_clients,
+                    loogle_max_input_tokens=args.loogle_max_input_tokens,
+                    loogle_prefix_max_docs=args.loogle_prefix_max_docs,
+                    loogle_prefix_dominant_client_id=args.dominant_client_prefix,
+                    loogle_prefix_cold_client_prefix=args.loogle_prefix_cold_client_prefix,
+                    loogle_prefix_mix_mode=args.loogle_prefix_mix_mode,
+                    loogle_prefix_chunk_size=args.loogle_prefix_chunk_size,
                 )
 
                 if res.returncode != 0 or not out_file.exists():
@@ -602,6 +757,7 @@ def main() -> int:
                         cold,
                         out_file,
                         run_error,
+                        dominant_client_prefix=args.dominant_client_prefix,
                     )
                 else:
                     row = summarize_jsonl(
@@ -613,6 +769,7 @@ def main() -> int:
                         req_count,
                         dominant,
                         cold,
+                        dominant_client_prefix=args.dominant_client_prefix,
                     )
                 row["return_code"] = res.returncode
                 row["server_url"] = base_url
@@ -621,6 +778,7 @@ def main() -> int:
                     f"[done] policy={run_label} rate={rate} k={kval} n={req_count} "
                     f"success={row['success_count']}/{row['total_requests']} "
                     f"p50={row['ttft_p50_ms']:.1f}ms p99={row['ttft_p99_ms']:.1f}ms"
+                    f"{dominant_summary_suffix(row)}"
                 )
         else:
             for policy, run_label, extra_env in policy_runs:
@@ -646,11 +804,16 @@ def main() -> int:
                         cold = int(round(req_count * args.cold_fraction))
                         cold = min(max(cold, 1), req_count - 1)
                         dominant = req_count - cold
+                    elif args.dataset == "loogle_prefix":
+                        dominant = int(round(req_count * args.loogle_prefix_dominant_fraction))
+                        dominant = min(max(dominant, 1), req_count - 1)
+                        cold = req_count - dominant
                     else:
                         cold = 0
                         dominant = 0
 
                     out_file = run_dir / f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
+                    reset_experiment_state(base_url)
                     res = run_client_once(
                         base_url=base_url,
                         policy=policy,
@@ -668,6 +831,12 @@ def main() -> int:
                         min_turns=args.min_turns,
                         num_dominant_clients=args.num_dominant_clients,
                         num_cold_clients=args.num_cold_clients,
+                        loogle_max_input_tokens=args.loogle_max_input_tokens,
+                        loogle_prefix_max_docs=args.loogle_prefix_max_docs,
+                        loogle_prefix_dominant_client_id=args.dominant_client_prefix,
+                        loogle_prefix_cold_client_prefix=args.loogle_prefix_cold_client_prefix,
+                        loogle_prefix_mix_mode=args.loogle_prefix_mix_mode,
+                        loogle_prefix_chunk_size=args.loogle_prefix_chunk_size,
                     )
 
                     if res.returncode != 0 or not out_file.exists():
@@ -692,6 +861,7 @@ def main() -> int:
                             cold,
                             out_file,
                             run_error,
+                            dominant_client_prefix=args.dominant_client_prefix,
                         )
                     else:
                         row = summarize_jsonl(
@@ -703,6 +873,7 @@ def main() -> int:
                             req_count,
                             dominant,
                             cold,
+                            dominant_client_prefix=args.dominant_client_prefix,
                         )
                     row["return_code"] = res.returncode
                     row["server_url"] = base_url
@@ -711,6 +882,7 @@ def main() -> int:
                         f"[done] policy={policy} rate={rate} k={kval} n={req_count} "
                         f"success={row['success_count']}/{row['total_requests']} "
                         f"p50={row['ttft_p50_ms']:.1f}ms p99={row['ttft_p99_ms']:.1f}ms"
+                        f"{dominant_summary_suffix(row)}"
                     )
 
         json_path, csv_path = write_outputs(summaries, out_dir)

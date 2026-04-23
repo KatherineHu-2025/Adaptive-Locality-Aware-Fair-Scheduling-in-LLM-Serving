@@ -156,6 +156,7 @@ def load_request_logs(df, folder: Path):
         "arrival_time",
         "ttft_ms",
         "tpot_ms",
+        "request_total_ms",
         "prompt_len",
         "output_tokens",
         "cached_len",
@@ -445,6 +446,106 @@ def plot_ttft_request_histograms(req_df, out_path: Path) -> bool:
         ax.set_ylim(0, max_bin_count * 1.10)
 
     fig.suptitle("Request-Level TTFT Histograms with P50/P99")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def plot_request_total_histograms(req_df, out_path: Path) -> bool:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if req_df.empty:
+        return False
+
+    ok = req_df[(req_df["success"] == True) & (req_df["ttft_ms"] >= 0)].copy()
+    if ok.empty:
+        return False
+
+    # Prefer precomputed request_total_ms from workload.client. Fallback keeps
+    # compatibility with older logs that only have ttft_ms/tpot_ms.
+    if "request_total_ms" in ok.columns and ok["request_total_ms"].notna().any():
+        ok["request_total_ms"] = ok["request_total_ms"].fillna(-1)
+        missing_mask = ok["request_total_ms"] < 0
+        if missing_mask.any():
+            decode_steps = (ok.loc[missing_mask, "output_tokens"].fillna(0).clip(lower=0) - 1).clip(lower=0)
+            decode_tail_ms = decode_steps * ok.loc[missing_mask, "tpot_ms"].fillna(-1).clip(lower=0)
+            ok.loc[missing_mask, "request_total_ms"] = ok.loc[missing_mask, "ttft_ms"] + decode_tail_ms
+    else:
+        decode_steps = (ok["output_tokens"].fillna(0).clip(lower=0) - 1).clip(lower=0)
+        decode_tail_ms = decode_steps * ok["tpot_ms"].fillna(-1).clip(lower=0)
+        ok["request_total_ms"] = ok["ttft_ms"] + decode_tail_ms
+    ok = ok[ok["request_total_ms"] >= 0]
+    if ok.empty:
+        return False
+
+    policies = sorted(ok["policy"].dropna().unique())
+    if not policies:
+        return False
+
+    policy_vals: dict[str, list[float]] = {
+        policy: ok.loc[ok["policy"] == policy, "request_total_ms"].dropna().tolist() for policy in policies
+    }
+    all_vals = [v for vals in policy_vals.values() for v in vals]
+    if not all_vals:
+        return False
+
+    global_min = float(min(all_vals))
+    global_max = float(max(all_vals))
+    if global_max <= global_min:
+        global_max = global_min + 1.0
+
+    bins_n = min(35, max(8, len(all_vals) // 20))
+    step = (global_max - global_min) / bins_n
+    bin_edges = [global_min + i * step for i in range(bins_n + 1)]
+
+    n = len(policies)
+    cols = 2
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(14, max(4 * rows, 5)), dpi=150)
+    if rows == 1 and cols == 1:
+        axes = [[axes]]
+    elif rows == 1:
+        axes = [axes]
+
+    flat_axes = [ax for row_axes in axes for ax in row_axes]
+    max_bin_count = 0.0
+
+    for i, policy in enumerate(policies):
+        ax = flat_axes[i]
+        vals = policy_vals[policy]
+        if not vals:
+            ax.text(0.5, 0.5, "No end-to-end samples", ha="center", va="center")
+            ax.set_title(f"{policy} End-to-End")
+            continue
+
+        counts, _, _ = ax.hist(vals, bins=bin_edges, color=f"C{i}", alpha=0.75)
+        if len(counts) > 0:
+            max_bin_count = max(max_bin_count, float(max(counts)))
+        p50 = float(sorted(vals)[max(0, math.ceil(0.50 * len(vals)) - 1)])
+        p99 = float(sorted(vals)[max(0, math.ceil(0.99 * len(vals)) - 1)])
+        ax.axvline(p50, color="black", linestyle="--", linewidth=1.5, label=f"P50={p50:.1f} ms")
+        ax.axvline(p99, color="red", linestyle=":", linewidth=1.5, label=f"P99={p99:.1f} ms")
+        ax.set_title(f"{policy} End-to-End Distribution")
+        ax.set_xlabel("Request time (arrival to completion, ms)")
+        ax.set_ylabel("Count")
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(loc="best")
+
+    for j in range(len(policies), len(flat_axes)):
+        flat_axes[j].axis("off")
+
+    if max_bin_count <= 0:
+        max_bin_count = 1.0
+    for i in range(len(policies)):
+        ax = flat_axes[i]
+        ax.set_xlim(global_min, global_max)
+        ax.set_ylim(0, max_bin_count * 1.10)
+
+    fig.suptitle("Request-Level End-to-End Latency Histograms with P50/P99")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
@@ -824,6 +925,7 @@ def main() -> int:
     pareto_plot = out_dir / f"{prefix}_pareto.png"
     ttft_percentile_hist_plot = out_dir / f"{prefix}_ttft_percentile_hist.png"
     ttft_request_hist_plot = out_dir / f"{prefix}_ttft_request_hist.png"
+    request_total_hist_plot = out_dir / f"{prefix}_request_total_hist.png"
     aimd_overview_plot = out_dir / f"{prefix}_aimd_overview.png"
     aimd_reasons_plot = out_dir / f"{prefix}_aimd_violation_reasons.png"
     aimd_trace_dir = out_dir / f"{prefix}_aimd_traces"
@@ -846,6 +948,7 @@ def main() -> int:
     plot_pareto(df=df, out_path=pareto_plot)
     made_ttft_percentile_hist = plot_ttft_percentile_histograms(df=df, out_path=ttft_percentile_hist_plot)
     made_ttft_request_hist = plot_ttft_request_histograms(req_df=req_df, out_path=ttft_request_hist_plot)
+    made_request_total_hist = plot_request_total_histograms(req_df=req_df, out_path=request_total_hist_plot)
     made_aimd_overview = plot_aimd_overview(req_df=req_df, out_path=aimd_overview_plot)
     made_aimd_reasons = plot_aimd_violation_reasons(req_df=req_df, out_path=aimd_reasons_plot)
     aimd_trace_paths = plot_all_aimd_traces(req_df=req_df, out_dir=out_dir, prefix=prefix)
@@ -860,6 +963,7 @@ def main() -> int:
     print("pareto plot:", pareto_plot)
     print("ttft percentile histogram:", ttft_percentile_hist_plot if made_ttft_percentile_hist else "(skipped: no data)")
     print("ttft request histogram:", ttft_request_hist_plot if made_ttft_request_hist else "(skipped: no request TTFT data)")
+    print("request total histogram:", request_total_hist_plot if made_request_total_hist else "(skipped: no request end-to-end data)")
     print("aimd overview:", aimd_overview_plot if made_aimd_overview else "(skipped: no AIMD metadata)")
     print("aimd violation reasons:", aimd_reasons_plot if made_aimd_reasons else "(skipped: no violation reason data)")
     if aimd_trace_paths:

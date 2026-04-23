@@ -101,6 +101,7 @@ secrets = []
     scaledown_window=900,
     secrets=secrets,
 )
+@modal.concurrent(max_inputs=100, target_inputs=16)
 @modal.asgi_app()
 def hosted_minisgl_app():
     """Deploy a persistent HTTP endpoint that proxies requests to minisgl."""
