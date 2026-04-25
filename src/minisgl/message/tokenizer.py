@@ -57,6 +57,10 @@ class TokenizeMsg(BaseTokenizerMsg):
     # Set by api_server.py from the HTTP "client_id" field.
     # Defaults to "" so existing callers work without changes.
     client_id: str = ""
+    # Frontend/API receive timestamp from time.perf_counter().
+    # Used by adaptive telemetry so TTFT includes frontend/tokenizer/backend
+    # queueing after the HTTP handler accepts the request.
+    arrival_time: float = 0.0
 
 
 @dataclass

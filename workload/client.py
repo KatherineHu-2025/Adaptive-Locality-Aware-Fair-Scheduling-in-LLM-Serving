@@ -116,6 +116,7 @@ class RequestResult:
     aimd_violated: bool = False
     aimd_violation_reason: str = "none"
     aimd_step: int = -1
+    conversation_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,11 @@ def build_arrival_plan(
         interarrivals = gamma_interarrivals(len(specs), rate=rate, k=k, seed=seed)
         scheduled = np.cumsum(interarrivals)
         return list(zip(scheduled.tolist(), specs))
+
+    if arrival_mode == "preset":
+        # Use pre-assigned arrival_time values on each spec (set by the dataset loader).
+        # Specs should already be sorted by arrival_time.
+        return [(spec.arrival_time, spec) for spec in specs]
 
     if arrival_mode != "per-client":
         raise ValueError(f"Unknown arrival mode: {arrival_mode}")
@@ -237,6 +243,7 @@ async def _send_one(
                     output_tokens=0, expected_output_len=spec.expected_output_len,
                     policy=policy, success=False,
                     error=f"HTTP {resp.status}: {body[:200]}",
+                    conversation_id=spec.conversation_id,
                 )
 
             # Parse SSE stream: "data: <token>", "data: [DONE]", or metadata.
@@ -302,6 +309,7 @@ async def _send_one(
         aimd_violated=aimd_violated,
         aimd_violation_reason=aimd_violation_reason,
         aimd_step=aimd_step,
+        conversation_id=spec.conversation_id,
     )
 
 
@@ -364,6 +372,7 @@ async def replay(
     timeout: float = 120.0,
     max_concurrency: int = 64,
     arrival_mode: str = "global",
+    preserve_arrival_times: bool = False,
 ) -> List[RequestResult]:
     """
     Replay a list of RequestSpec objects against the server using a
@@ -388,6 +397,9 @@ async def replay(
                       "sequential" — one coroutine per client; turns sent in
                                      order, each waiting for the previous
                                      response (models real multi-turn chat)
+    preserve_arrival_times
+                    : sequential mode only; use RequestSpec.arrival_time
+                      directly instead of rescaling it to match --rate.
 
     Returns
     -------
@@ -413,33 +425,39 @@ async def replay(
     # the prefix is cached when the next turn arrives.
     # ------------------------------------------------------------------
     if arrival_mode == "sequential":
-        by_client: dict[str, List[RequestSpec]] = {}
+        # Group by conversation_id if set, else fall back to client_id.
+        # This lets misbehaving-scenario specs share a client_id (server
+        # fairness tracking) while each conversation runs its own coroutine.
+        by_conv: dict[str, List[RequestSpec]] = {}
         for spec in specs:
-            by_client.setdefault(spec.client_id, []).append(spec)
+            key = spec.conversation_id if spec.conversation_id else spec.client_id
+            by_conv.setdefault(key, []).append(spec)
 
-        # Rescale per-client start times so the mean inter-client arrival
-        # rate matches `rate`.  Each client's raw start time is the
-        # arrival_time stored on its first RequestSpec (set by the dataset
+        # Rescale per-conversation start times so the mean inter-conversation
+        # arrival rate matches `rate`.  Each conversation's raw start time is
+        # the arrival_time stored on its first RequestSpec (set by the dataset
         # loader from the real tstamp, relative to the earliest conversation).
-        # If no client has a non-zero start time (e.g. synthetic / LooGLE),
-        # scale_factor stays 1.0 and all clients start at t=0.
-        raw_starts = sorted(
-            cspecs[0].arrival_time
-            for cspecs in by_client.values()
-            if cspecs[0].arrival_time > 0.0
-        )
-        if len(raw_starts) >= 2 and rate > 0.0:
-            interarrivals = [
-                b - a for a, b in zip([0.0] + raw_starts[:-1], raw_starts)
-            ]
-            mean_interarrival = sum(interarrivals) / len(interarrivals)
-            # scale_factor s.t. rescaled mean inter-arrival = 1/rate
-            scale_factor = mean_interarrival * rate
-        else:
+        # If no conversation has a non-zero start time (e.g. misbehave mode
+        # sets all to 0.0), scale_factor stays 1.0 and all start at t=0.
+        if preserve_arrival_times:
             scale_factor = 1.0
+        else:
+            raw_starts = sorted(
+                cspecs[0].arrival_time
+                for cspecs in by_conv.values()
+                if cspecs[0].arrival_time > 0.0
+            )
+            if len(raw_starts) >= 2 and rate > 0.0:
+                interarrivals = [
+                    b - a for a, b in zip([0.0] + raw_starts[:-1], raw_starts)
+                ]
+                mean_interarrival = sum(interarrivals) / len(interarrivals)
+                scale_factor = mean_interarrival * rate
+            else:
+                scale_factor = 1.0
 
-        n_clients = max(len(by_client), 1)
-        connector = aiohttp.TCPConnector(limit=n_clients)
+        n_convos = max(len(by_conv), 1)
+        connector = aiohttp.TCPConnector(limit=n_convos)
         async with aiohttp.ClientSession(connector=connector) as session:
             t0 = time.perf_counter()
             tasks = [
@@ -449,7 +467,7 @@ async def replay(
                         initial_delay=cspecs[0].arrival_time / scale_factor,
                     )
                 )
-                for cspecs in by_client.values()
+                for cspecs in by_conv.values()
             ]
             await asyncio.gather(*tasks)
 
@@ -633,7 +651,7 @@ def _parse_args():
     p.add_argument("--server",  default="http://127.0.0.1:19190")
     p.add_argument("--dataset", choices=["synthetic", "loogle", "chatbot_arena"],
                    default="synthetic")
-    p.add_argument("--arrival-mode", choices=["global", "per-client", "sequential"], default="global",
+    p.add_argument("--arrival-mode", choices=["global", "per-client", "sequential", "preset"], default="global",
                    help=(
                        "Arrival process mode: "
                        "'global' = one Gamma process for all requests; "
@@ -665,6 +683,41 @@ def _parse_args():
                    help="chatbot_arena only: skip conversations with fewer turns than this")
     p.add_argument("--loogle-max-input-tokens", type=int, default=26000,
                    help="loogle only: conservative estimated input-token cap; set <=0 to disable truncation")
+    # Misbehaving-client scenario (replicates DLPM paper §6.3)
+    p.add_argument("--misbehave-scenario", action="store_true",
+                   help="chatbot_arena only: rate-based misbehaving-client scenario (forces sequential mode)")
+    p.add_argument("--n-well-groups", type=int, default=2,
+                   help="Number of well-behaved client groups (default 2)")
+    p.add_argument("--n-misbehave-groups", type=int, default=2,
+                   help="Number of misbehaving client groups (default 2)")
+    p.add_argument("--n-convos-per-group", type=int, default=100,
+                   help="Maximum conversation starts per group in misbehave mode (default 100)")
+    p.add_argument("--rate-well", type=float, default=0.5,
+                   help="Poisson conversation-start rate for well-behaved groups (req/s, default 0.5)")
+    p.add_argument("--rate-misbehave", type=float, default=1.5,
+                   help="Poisson conversation-start rate for misbehaving groups (req/s, default 1.5)")
+    p.add_argument("--misbehave-duration-sec", type=float, default=30.0,
+                   help="Fixed duration used to generate misbehaving scenario arrivals (default 30s)")
+    p.add_argument("--misbehave-phase-profile", choices=["steady", "alternating"], default="steady",
+                   help="misbehave mode: steady fixed-rate arrivals or alternating well-heavy/mis-heavy phases")
+    p.add_argument("--num-phases", type=int, default=1,
+                   help="misbehave alternating mode: number of phases")
+    p.add_argument("--phase-duration-sec", type=float, default=0.0,
+                   help="misbehave alternating mode: seconds per phase; <=0 uses --misbehave-duration-sec")
+    p.add_argument("--rate-well-low", type=float, default=0.0,
+                   help="misbehave alternating mode: low well-behaved conversation-start rate; <=0 derives from --rate-well")
+    p.add_argument("--rate-well-high", type=float, default=0.0,
+                   help="misbehave alternating mode: high well-behaved conversation-start rate; <=0 uses --rate-well")
+    p.add_argument("--rate-misbehave-low", type=float, default=0.0,
+                   help="misbehave alternating mode: low misbehaving conversation-start rate; <=0 derives from --rate-misbehave")
+    p.add_argument("--rate-misbehave-high", type=float, default=0.0,
+                   help="misbehave alternating mode: high misbehaving conversation-start rate; <=0 uses --rate-misbehave")
+    p.add_argument("--well-min-turns", type=int, default=1,
+                   help="misbehave mode: minimum turns for well-behaved conversations")
+    p.add_argument("--well-max-turns", type=int, default=0,
+                   help="misbehave mode: maximum turns for well-behaved conversations; <=0 disables")
+    p.add_argument("--misbehave-min-turns", type=int, default=0,
+                   help="misbehave mode: minimum turns for misbehaving conversations; <=0 uses --min-turns")
     return p.parse_args()
 
 
@@ -685,8 +738,33 @@ async def _main():
         loogle_cap = args.loogle_max_input_tokens if args.loogle_max_input_tokens > 0 else None
         specs = load_loogle(max_docs=args.max_reqs, one_per_doc=False, max_input_tokens=loogle_cap)
     elif args.dataset == "chatbot_arena":
-        from workload.dataset import load_chatbot_arena
-        specs = load_chatbot_arena(max_conversations=args.max_reqs, min_turns=args.min_turns)
+        if args.misbehave_scenario:
+            from workload.dataset import load_chatbot_arena_misbehave_rate
+            specs = load_chatbot_arena_misbehave_rate(
+                n_well_groups=args.n_well_groups,
+                n_misbehave_groups=args.n_misbehave_groups,
+                n_convos_per_group=args.n_convos_per_group,
+                rate_well=args.rate_well,
+                rate_misbehave=args.rate_misbehave,
+                duration_sec=args.misbehave_duration_sec,
+                phase_profile=args.misbehave_phase_profile,
+                num_phases=args.num_phases,
+                phase_duration_sec=args.phase_duration_sec if args.phase_duration_sec > 0 else None,
+                rate_well_low=args.rate_well_low if args.rate_well_low > 0 else None,
+                rate_well_high=args.rate_well_high if args.rate_well_high > 0 else None,
+                rate_misbehave_low=args.rate_misbehave_low if args.rate_misbehave_low > 0 else None,
+                rate_misbehave_high=args.rate_misbehave_high if args.rate_misbehave_high > 0 else None,
+                min_turns=args.min_turns,
+                well_min_turns=args.well_min_turns,
+                well_max_turns=args.well_max_turns if args.well_max_turns > 0 else None,
+                misbehave_min_turns=args.misbehave_min_turns if args.misbehave_min_turns > 0 else None,
+                seed=args.seed,
+            )
+            args.arrival_mode = "sequential"
+            args.preserve_arrival_times = True
+        else:
+            from workload.dataset import load_chatbot_arena
+            specs = load_chatbot_arena(max_conversations=args.max_reqs, min_turns=args.min_turns)
     else:
         raise ValueError(f"Unknown dataset: {args.dataset}")
 
@@ -710,6 +788,7 @@ async def _main():
         timeout=args.timeout,
         max_concurrency=args.max_concurrency,
         arrival_mode=args.arrival_mode,
+        preserve_arrival_times=getattr(args, "preserve_arrival_times", False),
     )
     print_summary(results)
 

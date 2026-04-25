@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,15 @@ def resolve_input_folder(folder_arg: str) -> Path:
         f"Could not find benchmark folder '{folder_arg}'. Tried: "
         + ", ".join(str(c) for c in candidates)
     )
+
+
+def fix_policy_label(policy: str, output_file: str) -> str:
+    """Split static DLPM rows by Q value encoded in their run filename."""
+    if str(policy) == "dlpm":
+        m = re.search(r"dlpm_q(\d+)_", Path(str(output_file)).name)
+        if m:
+            return f"dlpm_q{m.group(1)}"
+    return str(policy)
 
 
 def load_summary_csv(folder: Path):
@@ -61,6 +71,12 @@ def load_summary_csv(folder: Path):
     missing = sorted(required_cols - set(df.columns))
     if missing:
         raise ValueError(f"summary.csv is missing required columns: {missing}")
+
+    if "output_file" in df.columns:
+        df["policy"] = [
+            fix_policy_label(policy, output_file)
+            for policy, output_file in zip(df["policy"], df["output_file"])
+        ]
 
     # Ensure numeric columns are numeric for sorting/plotting.
     numeric_cols = [

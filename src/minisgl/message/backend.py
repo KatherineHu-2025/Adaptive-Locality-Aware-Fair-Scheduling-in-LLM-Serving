@@ -45,6 +45,9 @@ class UserMsg(BaseBackendMsg):
     # Populated by api_server.py from the HTTP "client_id" field (defaults to
     # str(uid) so existing callers that don't set it still get a unique ID).
     client_id: str = ""
+    # Frontend/API receive timestamp from time.perf_counter().
+    # If unset, scheduler falls back to its own receive time.
+    arrival_time: float = 0.0
 
 
 @dataclass

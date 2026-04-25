@@ -260,6 +260,7 @@ app = FastAPI(title="MiniSGL API Server", version="0.0.1", lifespan=lifespan)
 
 @app.post("/generate")
 async def generate(req: GenerateRequest, request: Request):
+    arrival_time = time.perf_counter()
     logger.debug("Received generate request %s", req)
     state = get_global_state()
     uid = state.new_user()
@@ -273,6 +274,7 @@ async def generate(req: GenerateRequest, request: Request):
             ),
             # --- pass client_id through ---
             client_id=req.client_id,
+            arrival_time=arrival_time,
         )
     )
 
@@ -296,6 +298,7 @@ async def v1_root():
 
 @app.post("/v1/chat/completions")
 async def v1_completions(req: OpenAICompletionRequest, request: Request):
+    arrival_time = time.perf_counter()
     state = get_global_state()
     if req.messages:
         prompt = [msg.model_dump() for msg in req.messages]
@@ -318,6 +321,7 @@ async def v1_completions(req: OpenAICompletionRequest, request: Request):
             ),
             # --- pass client_id through ---
             client_id=req.client_id,
+            arrival_time=arrival_time,
         )
     )
 

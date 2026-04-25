@@ -346,8 +346,9 @@ class Scheduler(SchedulerIOMixin):
                 )
             # --- NEW: store metadata for telemetry before adding to queue ---
             client_id = msg.client_id if msg.client_id else str(msg.uid)
+            arrival_time = msg.arrival_time if msg.arrival_time > 0.0 else time.perf_counter()
             # orig_prompt_len captured now; cached_len and q_at_scheduling filled at scheduling
-            self._req_meta[msg.uid] = (client_id, time.perf_counter(), len(msg.input_ids), 0, 0.0)
+            self._req_meta[msg.uid] = (client_id, arrival_time, len(msg.input_ids), 0, 0.0)
             self.prefill_manager.add_one_req(msg)
         elif isinstance(msg, ResetBackendMsg):
             logger.info_rank0("Resetting AIMD experiment state (scope=%s)", msg.scope)

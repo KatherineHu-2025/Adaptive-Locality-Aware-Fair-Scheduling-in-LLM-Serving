@@ -365,6 +365,21 @@ def stop_service(service_name: str) -> None:
     run_cmd(cmd, capture=False)
 
 
+def call_reset_experiment(base_url: str, label: str) -> None:
+    """POST /reset_experiment to clear AIMD Q and deficit state before each run."""
+    url = f"{base_url.rstrip('/')}/reset_experiment"
+    try:
+        data = json.dumps({"scope": "full"}).encode("utf-8")
+        req = urlrequest.Request(
+            url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+        )
+        with urlrequest.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        print(f"[reset] {label} ok={body.get('ok', '?')}")
+    except Exception as exc:
+        print(f"[reset] {label} warning: {exc} (continuing)")
+
+
 def run_client_once(
     base_url: str,
     policy: str,
@@ -382,6 +397,23 @@ def run_client_once(
     min_turns: int = 1,
     num_dominant_clients: int = 1,
     num_cold_clients: int = 1,
+    misbehave_scenario: bool = False,
+    n_well_groups: int = 2,
+    n_misbehave_groups: int = 2,
+    n_convos_per_group: int = 100,
+    rate_well: float = 0.5,
+    rate_misbehave: float = 1.5,
+    misbehave_duration_sec: float = 30.0,
+    misbehave_phase_profile: str = "steady",
+    num_phases: int = 1,
+    phase_duration_sec: float = 0.0,
+    rate_well_low: float = 0.0,
+    rate_well_high: float = 0.0,
+    rate_misbehave_low: float = 0.0,
+    rate_misbehave_high: float = 0.0,
+    well_min_turns: int = 1,
+    well_max_turns: int = 0,
+    misbehave_min_turns: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
@@ -425,6 +457,27 @@ def run_client_once(
 
     if dataset == "chatbot_arena" and min_turns > 1:
         cmd.extend(["--min-turns", str(min_turns)])
+
+    if misbehave_scenario:
+        cmd.extend([
+            "--misbehave-scenario",
+            "--n-well-groups", str(n_well_groups),
+            "--n-misbehave-groups", str(n_misbehave_groups),
+            "--n-convos-per-group", str(n_convos_per_group),
+            "--rate-well", str(rate_well),
+            "--rate-misbehave", str(rate_misbehave),
+            "--misbehave-duration-sec", str(misbehave_duration_sec),
+            "--misbehave-phase-profile", misbehave_phase_profile,
+            "--num-phases", str(num_phases),
+            "--phase-duration-sec", str(phase_duration_sec),
+            "--rate-well-low", str(rate_well_low),
+            "--rate-well-high", str(rate_well_high),
+            "--rate-misbehave-low", str(rate_misbehave_low),
+            "--rate-misbehave-high", str(rate_misbehave_high),
+            "--well-min-turns", str(well_min_turns),
+            "--well-max-turns", str(well_max_turns),
+            "--misbehave-min-turns", str(misbehave_min_turns),
+        ])
 
     print("[run]", " ".join(cmd))
     return run_cmd(cmd, capture=True)
@@ -492,6 +545,51 @@ def main() -> int:
                         help="Q lower bound for adaptive_dlpm (AIMD_Q_MIN)")
     parser.add_argument("--aimd-q-max", default="16000",
                         help="Q upper bound for adaptive_dlpm (AIMD_Q_MAX)")
+    parser.add_argument("--aimd-ttft-slo-ms", default="2000",
+                        help="P99 TTFT SLO for adaptive_dlpm (AIMD_TTFT_SLO_MS)")
+    parser.add_argument("--aimd-additive-step", default="500",
+                        help="Additive Q increase step for adaptive_dlpm (AIMD_ADDITIVE_STEP)")
+    parser.add_argument("--aimd-mult-factor", default="0.5",
+                        help="Multiplicative Q decrease factor for adaptive_dlpm (AIMD_MULT_FACTOR)")
+    parser.add_argument("--aimd-control-interval", default="50",
+                        help="Scheduling steps between adaptive_dlpm control updates (AIMD_CONTROL_INTERVAL)")
+    # Misbehaving-client scenario (replicates DLPM paper Section 6.3 / Figure 8)
+    parser.add_argument("--misbehave-scenario", action="store_true",
+                        help="Rate-based misbehaving-client scenario (DLPM paper §6.3). "
+                             "Creates 4 client groups: 2 well-behaved (rate_well starts/s), "
+                             "2 misbehaving (rate_misbehave starts/s). Uses arrival_mode=sequential.")
+    parser.add_argument("--n-well-groups", type=int, default=2,
+                        help="Number of well-behaved client groups (default 2)")
+    parser.add_argument("--n-misbehave-groups", type=int, default=2,
+                        help="Number of misbehaving client groups (default 2)")
+    parser.add_argument("--n-convos-per-group", type=int, default=100,
+                        help="Maximum conversation starts per group in misbehave mode (default 100)")
+    parser.add_argument("--rate-well", type=float, default=0.5,
+                        help="Poisson conversation-start rate for well-behaved groups (req/s, default 0.5)")
+    parser.add_argument("--rate-misbehave", type=float, default=1.5,
+                        help="Poisson conversation-start rate for misbehaving groups (req/s, default 1.5)")
+    parser.add_argument("--misbehave-duration-sec", type=float, default=30.0,
+                        help="Fixed duration used to generate misbehaving scenario arrivals (default 30s)")
+    parser.add_argument("--misbehave-phase-profile", choices=["steady", "alternating"], default="steady",
+                        help="misbehave mode: steady fixed-rate arrivals or alternating well-heavy/mis-heavy phases")
+    parser.add_argument("--num-phases", type=int, default=1,
+                        help="misbehave alternating mode: number of phases")
+    parser.add_argument("--phase-duration-sec", type=float, default=0.0,
+                        help="misbehave alternating mode: seconds per phase; <=0 uses --misbehave-duration-sec")
+    parser.add_argument("--rate-well-low", type=float, default=0.0,
+                        help="misbehave alternating mode: low well-behaved conversation-start rate; <=0 derives from --rate-well")
+    parser.add_argument("--rate-well-high", type=float, default=0.0,
+                        help="misbehave alternating mode: high well-behaved conversation-start rate; <=0 uses --rate-well")
+    parser.add_argument("--rate-misbehave-low", type=float, default=0.0,
+                        help="misbehave alternating mode: low misbehaving conversation-start rate; <=0 derives from --rate-misbehave")
+    parser.add_argument("--rate-misbehave-high", type=float, default=0.0,
+                        help="misbehave alternating mode: high misbehaving conversation-start rate; <=0 uses --rate-misbehave")
+    parser.add_argument("--well-min-turns", type=int, default=1,
+                        help="misbehave mode: minimum turns for well-behaved conversations")
+    parser.add_argument("--well-max-turns", type=int, default=0,
+                        help="misbehave mode: maximum turns for well-behaved conversations; <=0 disables")
+    parser.add_argument("--misbehave-min-turns", type=int, default=0,
+                        help="misbehave mode: minimum turns for misbehaving conversations; <=0 uses --min-turns")
     args = parser.parse_args()
 
     policies = parse_str_list(args.policies)
@@ -509,7 +607,7 @@ def main() -> int:
                 policy_runs.append((
                     policy,
                     f"dlpm_q{q}",
-                    {"AIMD_Q_INIT": str(q), "AIMD_Q_MIN": str(q), "AIMD_Q_MAX": str(q)},
+                    {"MINISGL_STATIC_Q": str(q)},
                 ))
         elif policy == "adaptive_dlpm":
             policy_runs.append((
@@ -520,6 +618,10 @@ def main() -> int:
                     "AIMD_Q_INIT": args.aimd_q_init,
                     "AIMD_Q_MIN": args.aimd_q_min,
                     "AIMD_Q_MAX": args.aimd_q_max,
+                    "AIMD_TTFT_SLO_MS": args.aimd_ttft_slo_ms,
+                    "AIMD_ADDITIVE_STEP": args.aimd_additive_step,
+                    "AIMD_MULT_FACTOR": args.aimd_mult_factor,
+                    "AIMD_CONTROL_INTERVAL": args.aimd_control_interval,
                 },
             ))
         else:
@@ -551,7 +653,8 @@ def main() -> int:
                     f"but endpoint reports '{reported_policy}' in /healthz."
                 )
 
-            for (policy, run_label, _), rate, kval, req_count in itertools.product(policy_runs, rates, ks, request_counts):
+            _run_grid = [(1.0, 1.0, 0)] if args.misbehave_scenario else list(itertools.product(rates, ks, request_counts))
+            for (policy, run_label, _), (rate, kval, req_count) in itertools.product(policy_runs, _run_grid):
                 if args.dataset == "synthetic":
                     cold = int(round(req_count * args.cold_fraction))
                     cold = min(max(cold, 1), req_count - 1)
@@ -560,7 +663,11 @@ def main() -> int:
                     cold = 0
                     dominant = 0
 
-                out_file = run_dir / f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
+                call_reset_experiment(base_url, f"{run_label} r={rate} k={kval} n={req_count}")
+                out_file = run_dir / (
+                    f"{run_label}_misbehave.jsonl" if args.misbehave_scenario
+                    else f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
+                )
                 res = run_client_once(
                     base_url=base_url,
                     policy=policy,
@@ -578,6 +685,23 @@ def main() -> int:
                     min_turns=args.min_turns,
                     num_dominant_clients=args.num_dominant_clients,
                     num_cold_clients=args.num_cold_clients,
+                    misbehave_scenario=args.misbehave_scenario,
+                    n_well_groups=args.n_well_groups,
+                    n_misbehave_groups=args.n_misbehave_groups,
+                    n_convos_per_group=args.n_convos_per_group,
+                    rate_well=args.rate_well,
+                    rate_misbehave=args.rate_misbehave,
+                    misbehave_duration_sec=args.misbehave_duration_sec,
+                    misbehave_phase_profile=args.misbehave_phase_profile,
+                    num_phases=args.num_phases,
+                    phase_duration_sec=args.phase_duration_sec,
+                    rate_well_low=args.rate_well_low,
+                    rate_well_high=args.rate_well_high,
+                    rate_misbehave_low=args.rate_misbehave_low,
+                    rate_misbehave_high=args.rate_misbehave_high,
+                    well_min_turns=args.well_min_turns,
+                    well_max_turns=args.well_max_turns,
+                    misbehave_min_turns=args.misbehave_min_turns,
                 )
 
                 if res.returncode != 0 or not out_file.exists():
@@ -641,7 +765,8 @@ def main() -> int:
                         "Try a unique --service-name or stop the app and retry."
                     )
 
-                for rate, kval, req_count in itertools.product(rates, ks, request_counts):
+                _run_grid = [(1.0, 1.0, 0)] if args.misbehave_scenario else list(itertools.product(rates, ks, request_counts))
+                for rate, kval, req_count in _run_grid:
                     if args.dataset == "synthetic":
                         cold = int(round(req_count * args.cold_fraction))
                         cold = min(max(cold, 1), req_count - 1)
@@ -650,7 +775,11 @@ def main() -> int:
                         cold = 0
                         dominant = 0
 
-                    out_file = run_dir / f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
+                    call_reset_experiment(base_url, f"{run_label} r={rate} k={kval} n={req_count}")
+                    out_file = run_dir / (
+                        f"{run_label}_misbehave.jsonl" if args.misbehave_scenario
+                        else f"{run_label}_r{rate}_k{kval}_n{req_count}.jsonl"
+                    )
                     res = run_client_once(
                         base_url=base_url,
                         policy=policy,
@@ -668,12 +797,29 @@ def main() -> int:
                         min_turns=args.min_turns,
                         num_dominant_clients=args.num_dominant_clients,
                         num_cold_clients=args.num_cold_clients,
+                        misbehave_scenario=args.misbehave_scenario,
+                        n_well_groups=args.n_well_groups,
+                        n_misbehave_groups=args.n_misbehave_groups,
+                        n_convos_per_group=args.n_convos_per_group,
+                        rate_well=args.rate_well,
+                        rate_misbehave=args.rate_misbehave,
+                        misbehave_duration_sec=args.misbehave_duration_sec,
+                        misbehave_phase_profile=args.misbehave_phase_profile,
+                        num_phases=args.num_phases,
+                        phase_duration_sec=args.phase_duration_sec,
+                        rate_well_low=args.rate_well_low,
+                        rate_well_high=args.rate_well_high,
+                        rate_misbehave_low=args.rate_misbehave_low,
+                        rate_misbehave_high=args.rate_misbehave_high,
+                        well_min_turns=args.well_min_turns,
+                        well_max_turns=args.well_max_turns,
+                        misbehave_min_turns=args.misbehave_min_turns,
                     )
 
                     if res.returncode != 0 or not out_file.exists():
                         run_error = format_run_error(res)
                         print(
-                            f"[error] policy={policy} rate={rate} k={kval} n={req_count} "
+                            f"[error] policy={run_label} rate={rate} k={kval} n={req_count} "
                             f"return_code={res.returncode}; output not available"
                         )
                         print(run_error)
@@ -683,7 +829,7 @@ def main() -> int:
                                 "(e.g., `huggingface-cli login` or set HUGGINGFACE_HUB_TOKEN)."
                             )
                         row = make_failed_row(
-                            policy,
+                            run_label,
                             args.dataset,
                             rate,
                             kval,
@@ -696,7 +842,7 @@ def main() -> int:
                     else:
                         row = summarize_jsonl(
                             out_file,
-                            policy,
+                            run_label,
                             args.dataset,
                             rate,
                             kval,
@@ -708,7 +854,7 @@ def main() -> int:
                     row["server_url"] = base_url
                     summaries.append(row)
                     print(
-                        f"[done] policy={policy} rate={rate} k={kval} n={req_count} "
+                        f"[done] policy={run_label} rate={rate} k={kval} n={req_count} "
                         f"success={row['success_count']}/{row['total_requests']} "
                         f"p50={row['ttft_p50_ms']:.1f}ms p99={row['ttft_p99_ms']:.1f}ms"
                     )

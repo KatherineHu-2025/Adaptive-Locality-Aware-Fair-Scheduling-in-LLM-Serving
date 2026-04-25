@@ -45,11 +45,18 @@ class RequestSpec:
     workload client (Step 1.6) uses this as a relative offset when
     replaying with a Gamma process; it does NOT mean wall-clock time.
     Set to 0.0 for datasets that don't carry timing information.
+
+    conversation_id — used by sequential replay mode to group turns into
+    independent coroutines.  Defaults to client_id (backward-compatible).
+    In misbehaving scenarios, multiple conversations share the same
+    client_id (so the server tracks their combined fairness) but have
+    distinct conversation_ids (so each gets its own sequential coroutine).
     """
     client_id: str
     prompt: str
     expected_output_len: int
     arrival_time: float = 0.0
+    conversation_id: str = ""  # empty → falls back to client_id in replay
 
 
 # ---------------------------------------------------------------------------
@@ -74,6 +81,7 @@ def load_chatbot_arena(
     max_conversations: Optional[int] = None,
     language: Optional[str] = "English",
     min_turns: int = 1,
+    max_turns: Optional[int] = None,
     token_len_fn: Callable[[str], int] = _word_count_estimator,
 ) -> List[RequestSpec]:
     """
@@ -101,6 +109,7 @@ def load_chatbot_arena(
     max_conversations   Cap on number of conversations to load (None = all)
     language            Filter to this language only (None = all languages)
     min_turns           Skip conversations with fewer turns than this
+    max_turns           Skip conversations with more turns than this
     token_len_fn        Callable(text) -> int for estimating output length.
                         Defaults to a word-count heuristic. Pass a real
                         tokenizer's encode function for exact counts.
@@ -150,6 +159,8 @@ def load_chatbot_arena(
 
         if len(pairs) < min_turns:
             continue
+        if max_turns is not None and len(pairs) > max_turns:
+            continue
 
         # Build prompts with growing context (prefix-cache friendly).
         # All turns in this conversation share the same tstamp; arrival_time
@@ -184,6 +195,290 @@ def load_chatbot_arena(
 
     return [s for _, conv_specs in conv_data for s in conv_specs]
 
+
+# ---------------------------------------------------------------------------
+# Chatbot Arena misbehaving-client scenario
+# ---------------------------------------------------------------------------
+
+def load_chatbot_arena_misbehave(
+    n_well_convos_per_group: int = 5,
+    n_misbehave_convos_per_group: int = 15,
+    n_well_groups: int = 2,
+    n_misbehave_groups: int = 2,
+    min_turns: int = 2,
+    language: Optional[str] = "English",
+    token_len_fn: Callable[[str], int] = _word_count_estimator,
+) -> List[RequestSpec]:
+    """
+    Replicate the original DLPM paper's misbehaving-client scenario
+    (Section 6.3, Figure 8) using Chatbot Arena data.
+
+    Setup
+    -----
+    Four virtual client groups are created:
+      - well_0, well_1        : n_well_convos_per_group conversations each
+      - misbehave_0, misbehave_1 : n_misbehave_convos_per_group conversations each
+
+    Each group is assigned a single client_id (e.g. "well_0") so the server
+    tracks their combined token budget for fairness.  Each conversation within
+    a group gets a unique conversation_id (e.g. "well_0_c3") so the sequential
+    replay runner spawns one coroutine per conversation.
+
+    Result: misbehaving groups run more parallel sequential threads → generate
+    proportionally more tokens → Jain index drops → AIMD triggers correctly.
+
+    All conversations start at t=0 (no stagger) so contention is immediate.
+
+    Parameters
+    ----------
+    n_well_convos_per_group      conversations assigned to each well-behaved group
+    n_misbehave_convos_per_group conversations assigned to each misbehaving group
+    n_well_groups                number of well-behaved client groups (default 2)
+    n_misbehave_groups           number of misbehaving client groups (default 2)
+    min_turns                    minimum turns per conversation (default 2)
+    """
+    total_needed = (
+        n_well_groups * n_well_convos_per_group
+        + n_misbehave_groups * n_misbehave_convos_per_group
+    )
+    # Load a flat list then re-group by original client_id to get per-conversation lists.
+    flat = load_chatbot_arena(
+        max_conversations=total_needed,
+        language=language,
+        min_turns=min_turns,
+        token_len_fn=token_len_fn,
+    )
+
+    # Collect per-conversation turn lists preserving order.
+    conversations: List[List[RequestSpec]] = []
+    current_conv: List[RequestSpec] = []
+    current_cid: Optional[str] = None
+    for spec in flat:
+        if spec.client_id != current_cid:
+            if current_conv:
+                conversations.append(current_conv)
+            current_conv = [spec]
+            current_cid = spec.client_id
+        else:
+            current_conv.append(spec)
+    if current_conv:
+        conversations.append(current_conv)
+
+    result: List[RequestSpec] = []
+    conv_idx = 0
+
+    def _assign(group_name: str, n_convos: int) -> None:
+        nonlocal conv_idx
+        for c in range(n_convos):
+            if conv_idx >= len(conversations):
+                break
+            conv_id = f"{group_name}_c{c}"
+            for spec in conversations[conv_idx]:
+                result.append(RequestSpec(
+                    client_id=group_name,
+                    conversation_id=conv_id,
+                    prompt=spec.prompt,
+                    expected_output_len=spec.expected_output_len,
+                    arrival_time=0.0,  # all start together
+                ))
+            conv_idx += 1
+
+    for g in range(n_well_groups):
+        _assign(f"well_{g}", n_well_convos_per_group)
+    for g in range(n_misbehave_groups):
+        _assign(f"misbehave_{g}", n_misbehave_convos_per_group)
+
+    return result
+
+
+def load_chatbot_arena_misbehave_rate(
+    n_well_groups: int = 2,
+    n_misbehave_groups: int = 2,
+    n_convos_per_group: int = 100,
+    rate_well: float = 0.5,
+    rate_misbehave: float = 1.5,
+    duration_sec: float = 30.0,
+    phase_profile: str = "steady",
+    num_phases: int = 1,
+    phase_duration_sec: Optional[float] = None,
+    rate_well_low: Optional[float] = None,
+    rate_well_high: Optional[float] = None,
+    rate_misbehave_low: Optional[float] = None,
+    rate_misbehave_high: Optional[float] = None,
+    min_turns: int = 2,
+    well_min_turns: int = 1,
+    well_max_turns: Optional[int] = None,
+    misbehave_min_turns: Optional[int] = None,
+    language: Optional[str] = "English",
+    token_len_fn: Callable[[str], int] = _word_count_estimator,
+    seed: int = 42,
+) -> List[RequestSpec]:
+    """
+    Rate-based misbehaving-client scenario (faithful DLPM paper §6.3 replication).
+
+    All groups run over the same measurement duration, but misbehaving groups
+    start conversations at a higher Poisson rate.  Each conversation keeps its
+    turns sequential, so turn N+1 is only sent after turn N completes and can
+    reuse the prefix cache.  Use with arrival_mode="sequential".
+
+    Parameters
+    ----------
+    n_well_groups       number of well-behaved client groups (default 2)
+    n_misbehave_groups  number of misbehaving client groups (default 2)
+    n_convos_per_group  max conversation starts per group (default 100)
+    rate_well           Poisson conversation-start rate for well groups (req/s)
+    rate_misbehave      Poisson conversation-start rate for misbehaving groups
+    duration_sec        fixed measurement duration for generating starts
+    phase_profile       "steady" for one fixed-rate interval; "alternating"
+                        alternates well-heavy and misbehave-heavy phases
+    num_phases          number of phases for alternating profile
+    phase_duration_sec  duration of each phase; defaults to duration_sec
+    rate_*_low/high     per-phase rates used by alternating profile
+    well_min_turns      minimum turns for well-behaved conversations
+    well_max_turns      maximum turns for well-behaved conversations
+    misbehave_min_turns minimum turns for misbehaving conversations
+    seed                RNG seed for reproducibility
+    """
+    import numpy as np
+
+    if duration_sec <= 0:
+        raise ValueError("duration_sec must be positive")
+    if rate_well <= 0 or rate_misbehave <= 0:
+        raise ValueError("rate_well and rate_misbehave must be positive")
+    if n_convos_per_group <= 0:
+        raise ValueError("n_convos_per_group must be positive")
+    if phase_profile not in {"steady", "alternating"}:
+        raise ValueError("phase_profile must be 'steady' or 'alternating'")
+    if num_phases <= 0:
+        raise ValueError("num_phases must be positive")
+    if phase_duration_sec is not None and phase_duration_sec <= 0:
+        raise ValueError("phase_duration_sec must be positive")
+
+    rng = np.random.default_rng(seed)
+    group_names = [f"well_{g}" for g in range(n_well_groups)] + [
+        f"misbehave_{g}" for g in range(n_misbehave_groups)
+    ]
+
+    if phase_profile == "steady":
+        phases = [(0.0, duration_sec)]
+        effective_duration_sec = duration_sec
+    else:
+        per_phase = phase_duration_sec if phase_duration_sec is not None else duration_sec
+        phases = [(i * per_phase, per_phase) for i in range(num_phases)]
+        effective_duration_sec = num_phases * per_phase
+
+    well_hi = rate_well_high if rate_well_high is not None else rate_well
+    mis_hi = rate_misbehave_high if rate_misbehave_high is not None else rate_misbehave
+    well_lo = rate_well_low if rate_well_low is not None else max(rate_well * 0.25, 0.05)
+    mis_lo = rate_misbehave_low if rate_misbehave_low is not None else max(rate_misbehave * 0.25, 0.05)
+
+    for name, value in {
+        "rate_well_low": well_lo,
+        "rate_well_high": well_hi,
+        "rate_misbehave_low": mis_lo,
+        "rate_misbehave_high": mis_hi,
+    }.items():
+        if value <= 0:
+            raise ValueError(f"{name} must be positive")
+
+    def _phase_rate(group_name: str, phase_idx: int) -> float:
+        if phase_profile == "steady":
+            return rate_well if group_name.startswith("well_") else rate_misbehave
+        well_heavy_phase = phase_idx % 2 == 0
+        if group_name.startswith("well_"):
+            return well_hi if well_heavy_phase else well_lo
+        return mis_lo if well_heavy_phase else mis_hi
+
+    group_starts: List[tuple[str, List[float]]] = []
+    total_needed = 0
+    for group_name in group_names:
+        starts: List[float] = []
+        for phase_idx, (phase_start, phase_duration) in enumerate(phases):
+            rate = _phase_rate(group_name, phase_idx)
+            t = 0.0
+            while len(starts) < n_convos_per_group:
+                t += float(rng.exponential(scale=1.0 / rate))
+                if t > phase_duration:
+                    break
+                starts.append(phase_start + t)
+            if len(starts) >= n_convos_per_group:
+                break
+        if not starts:
+            # Keep tiny test runs meaningful even when the sampled first arrival
+            # lands just outside a short duration.
+            fallback_rate = _phase_rate(group_name, 0)
+            starts = [min(effective_duration_sec, 1.0 / fallback_rate)]
+        group_starts.append((group_name, starts))
+        total_needed += len(starts)
+
+    effective_mis_min_turns = misbehave_min_turns if misbehave_min_turns is not None else min_turns
+
+    well_needed = sum(len(starts) for group_name, starts in group_starts if group_name.startswith("well_"))
+    mis_needed = total_needed - well_needed
+
+    def _regroup(flat: List[RequestSpec]) -> List[List[RequestSpec]]:
+        conversations: List[List[RequestSpec]] = []
+        current_conv: List[RequestSpec] = []
+        current_cid: Optional[str] = None
+        for spec in flat:
+            if spec.client_id != current_cid:
+                if current_conv:
+                    conversations.append(current_conv)
+                current_conv = [spec]
+                current_cid = spec.client_id
+            else:
+                current_conv.append(spec)
+        if current_conv:
+            conversations.append(current_conv)
+        return conversations
+
+    well_flat = load_chatbot_arena(
+        max_conversations=well_needed,
+        language=language,
+        min_turns=well_min_turns,
+        max_turns=well_max_turns,
+        token_len_fn=token_len_fn,
+    ) if well_needed > 0 else []
+    mis_flat = load_chatbot_arena(
+        max_conversations=mis_needed,
+        language=language,
+        min_turns=effective_mis_min_turns,
+        max_turns=None,
+        token_len_fn=token_len_fn,
+    ) if mis_needed > 0 else []
+
+    conversations_by_kind = {
+        "well": _regroup(well_flat),
+        "misbehave": _regroup(mis_flat),
+    }
+    conv_idx_by_kind = {"well": 0, "misbehave": 0}
+
+    result: List[RequestSpec] = []
+
+    for group_name, starts in group_starts:
+        pool_name = "well" if group_name.startswith("well_") else "misbehave"
+        conversations = conversations_by_kind[pool_name]
+        for c, start_time in enumerate(starts):
+            conv_idx = conv_idx_by_kind[pool_name]
+            if conv_idx >= len(conversations):
+                break
+            conv_idx_by_kind[pool_name] += 1
+            conv_id = f"{group_name}_c{c}"
+            for spec in conversations[conv_idx]:
+                result.append(RequestSpec(
+                    client_id=group_name,
+                    conversation_id=conv_id,
+                    prompt=spec.prompt,
+                    expected_output_len=spec.expected_output_len,
+                    # Only the first turn's arrival_time is consulted by
+                    # sequential replay. Leaving it on every turn is harmless
+                    # and useful for debugging the generated trace.
+                    arrival_time=start_time,
+                ))
+
+    # Sort conversation groups by start time for deterministic replay logs.
+    result.sort(key=lambda s: s.arrival_time)
+    return result
 
 # ---------------------------------------------------------------------------
 # Synthetic starvation workload generator

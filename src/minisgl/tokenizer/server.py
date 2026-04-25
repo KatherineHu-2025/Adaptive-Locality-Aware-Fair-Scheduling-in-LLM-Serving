@@ -111,6 +111,7 @@ def tokenize_worker(
                             sampling_params=msg.sampling_params,
                             # --- pass client_id through ---
                             client_id=msg.client_id,
+                            arrival_time=msg.arrival_time,
                         )
                         for msg, t in zip(tokenize_msg, tensors, strict=True)
                     ]

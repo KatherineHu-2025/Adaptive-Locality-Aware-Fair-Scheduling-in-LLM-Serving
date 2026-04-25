@@ -18,7 +18,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
-from workload.dataset import RequestSpec, load_synthetic, load_loogle, _word_count_estimator
+from workload.dataset import (
+    RequestSpec,
+    load_chatbot_arena_misbehave_rate,
+    load_synthetic,
+    load_loogle,
+    _word_count_estimator,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +119,135 @@ class TestLoadSynthetic:
 
     def test_empty(self):
         assert load_synthetic(dominant_reqs=0, cold_reqs=0) == []
+
+
+# ---------------------------------------------------------------------------
+# Chatbot Arena misbehaving scenario (mocked, no HuggingFace access needed)
+# ---------------------------------------------------------------------------
+
+class TestLoadChatbotArenaMisbehaveRate:
+    def _fake_chatbot_loader(self, max_conversations, **kwargs):
+        min_turns = int(kwargs.get("min_turns", 1))
+        max_turns = kwargs.get("max_turns")
+        specs = []
+        i = 0
+        while len({s.client_id for s in specs}) < max_conversations:
+            turns = 1 if max_turns == 1 else max(min_turns, 3)
+            cid = f"orig_{i}"
+            for turn in range(turns):
+                specs.append(RequestSpec(
+                    client_id=cid,
+                    prompt="\n".join(
+                        [f"Human: question {i}"]
+                        + [f"Assistant: answer {i}.{j}\nHuman: followup {i}.{j}" for j in range(turn)]
+                    ),
+                    expected_output_len=8,
+                ))
+            i += 1
+        return specs
+
+    def test_misbehaving_groups_get_more_conversation_starts(self, monkeypatch):
+        monkeypatch.setattr(
+            "workload.dataset.load_chatbot_arena",
+            self._fake_chatbot_loader,
+        )
+
+        specs = load_chatbot_arena_misbehave_rate(
+            n_well_groups=1,
+            n_misbehave_groups=1,
+            n_convos_per_group=100,
+            rate_well=0.2,
+            rate_misbehave=1.0,
+            duration_sec=20.0,
+            seed=1,
+        )
+
+        well_convos = {s.conversation_id for s in specs if s.client_id == "well_0"}
+        mis_convos = {s.conversation_id for s in specs if s.client_id == "misbehave_0"}
+        assert len(mis_convos) > len(well_convos)
+        assert all(0.0 < s.arrival_time <= 20.0 for s in specs)
+
+    def test_well_can_be_single_turn_while_misbehave_is_multiturn(self, monkeypatch):
+        monkeypatch.setattr(
+            "workload.dataset.load_chatbot_arena",
+            self._fake_chatbot_loader,
+        )
+
+        specs = load_chatbot_arena_misbehave_rate(
+            n_well_groups=1,
+            n_misbehave_groups=1,
+            n_convos_per_group=4,
+            rate_well=10.0,
+            rate_misbehave=10.0,
+            duration_sec=100.0,
+            well_min_turns=1,
+            well_max_turns=1,
+            misbehave_min_turns=3,
+            seed=0,
+        )
+
+        by_conv = {}
+        for spec in specs:
+            by_conv.setdefault(spec.conversation_id, []).append(spec)
+        well_lengths = [len(v) for k, v in by_conv.items() if k.startswith("well_")]
+        mis_lengths = [len(v) for k, v in by_conv.items() if k.startswith("misbehave_")]
+        assert well_lengths and all(n == 1 for n in well_lengths)
+        assert mis_lengths and all(n >= 3 for n in mis_lengths)
+
+    def test_conversation_cap_is_respected(self, monkeypatch):
+        monkeypatch.setattr(
+            "workload.dataset.load_chatbot_arena",
+            self._fake_chatbot_loader,
+        )
+
+        specs = load_chatbot_arena_misbehave_rate(
+            n_well_groups=1,
+            n_misbehave_groups=1,
+            n_convos_per_group=3,
+            rate_well=10.0,
+            rate_misbehave=10.0,
+            duration_sec=100.0,
+            seed=0,
+        )
+
+        convos = {s.conversation_id for s in specs}
+        assert len(convos) == 6
+
+    def test_alternating_phases_shift_group_pressure(self, monkeypatch):
+        monkeypatch.setattr(
+            "workload.dataset.load_chatbot_arena",
+            self._fake_chatbot_loader,
+        )
+
+        specs = load_chatbot_arena_misbehave_rate(
+            n_well_groups=1,
+            n_misbehave_groups=1,
+            n_convos_per_group=100,
+            rate_well=1.0,
+            rate_misbehave=1.0,
+            duration_sec=20.0,
+            phase_profile="alternating",
+            num_phases=2,
+            phase_duration_sec=20.0,
+            rate_well_high=2.0,
+            rate_well_low=0.1,
+            rate_misbehave_high=2.0,
+            rate_misbehave_low=0.1,
+            seed=3,
+        )
+
+        starts = {}
+        for spec in specs:
+            starts.setdefault(spec.conversation_id, (spec.client_id, spec.arrival_time))
+        first_phase = [v for v in starts.values() if v[1] <= 20.0]
+        second_phase = [v for v in starts.values() if 20.0 < v[1] <= 40.0]
+
+        assert sum(1 for cid, _ in first_phase if cid == "well_0") > sum(
+            1 for cid, _ in first_phase if cid == "misbehave_0"
+        )
+        assert sum(1 for cid, _ in second_phase if cid == "misbehave_0") > sum(
+            1 for cid, _ in second_phase if cid == "well_0"
+        )
 
 
 # ---------------------------------------------------------------------------
