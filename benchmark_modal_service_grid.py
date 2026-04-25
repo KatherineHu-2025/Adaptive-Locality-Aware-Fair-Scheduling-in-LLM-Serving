@@ -488,6 +488,7 @@ def run_client_once(
     loogle_prefix_cold_client_prefix: str = "client_cold",
     loogle_prefix_mix_mode: str = "interleave",
     loogle_prefix_chunk_size: int = 20,
+    loogle_prefix_strict_cold: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         sys.executable,
@@ -552,6 +553,8 @@ def run_client_once(
             "--loogle-prefix-chunk-size",
             str(loogle_prefix_chunk_size),
         ])
+        if loogle_prefix_strict_cold:
+            cmd.append("--loogle-prefix-strict-cold")
 
     if dataset == "chatbot_arena" and min_turns > 1:
         cmd.extend(["--min-turns", str(min_turns)])
@@ -609,6 +612,8 @@ def main() -> int:
                         help="loogle_prefix only: request ordering strategy for dominant/cold mix")
     parser.add_argument("--loogle-prefix-chunk-size", type=int, default=20,
                         help="loogle_prefix only: chunk size used when mix mode is 'chunked'")
+    parser.add_argument("--loogle-prefix-strict-cold", action="store_true",
+                        help="loogle_prefix only: prepend a unique cold-only prefix so cache hits stay near zero")
     parser.add_argument("--arrival-mode", choices=["global", "per-client", "sequential"], default="per-client")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--max-concurrency", type=int, default=2)
@@ -630,6 +635,8 @@ def main() -> int:
     # Adaptive DLPM knobs passed as deploy-time env vars
     parser.add_argument("--aimd-jain-threshold", default="0.75",
                         help="Jain fairness threshold for adaptive_dlpm (AIMD_JAIN_THRESHOLD)")
+    parser.add_argument("--aimd-ttft-slo-ms", default="2000",
+                        help="P99 TTFT threshold in ms for adaptive_dlpm (AIMD_TTFT_SLO_MS)")
     parser.add_argument("--aimd-q-init", default="4000",
                         help="Initial Q for adaptive_dlpm (AIMD_Q_INIT)")
     parser.add_argument("--aimd-q-min", default="1200",
@@ -661,6 +668,7 @@ def main() -> int:
                 "adaptive_dlpm",
                 {
                     "AIMD_JAIN_THRESHOLD": args.aimd_jain_threshold,
+                    "AIMD_TTFT_SLO_MS": args.aimd_ttft_slo_ms,
                     "AIMD_Q_INIT": args.aimd_q_init,
                     "AIMD_Q_MIN": args.aimd_q_min,
                     "AIMD_Q_MAX": args.aimd_q_max,
@@ -733,6 +741,7 @@ def main() -> int:
                     loogle_prefix_cold_client_prefix=args.loogle_prefix_cold_client_prefix,
                     loogle_prefix_mix_mode=args.loogle_prefix_mix_mode,
                     loogle_prefix_chunk_size=args.loogle_prefix_chunk_size,
+                    loogle_prefix_strict_cold=args.loogle_prefix_strict_cold,
                 )
 
                 if res.returncode != 0 or not out_file.exists():
@@ -837,6 +846,7 @@ def main() -> int:
                         loogle_prefix_cold_client_prefix=args.loogle_prefix_cold_client_prefix,
                         loogle_prefix_mix_mode=args.loogle_prefix_mix_mode,
                         loogle_prefix_chunk_size=args.loogle_prefix_chunk_size,
+                        loogle_prefix_strict_cold=args.loogle_prefix_strict_cold,
                     )
 
                     if res.returncode != 0 or not out_file.exists():

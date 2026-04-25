@@ -41,8 +41,10 @@ def main() -> int:
     parser.add_argument("--loogle-prefix-cold-client-prefix", default="client_cold")
     parser.add_argument("--loogle-prefix-mix-mode", choices=["interleave", "random", "chunked"], default="chunked")
     parser.add_argument("--loogle-prefix-chunk-size", type=int, default=20)
+    parser.add_argument("--loogle-prefix-strict-cold", action="store_true")
 
     parser.add_argument("--aimd-jain-threshold", default="0.82")
+    parser.add_argument("--aimd-ttft-slo-ms", default="2000")
     parser.add_argument("--aimd-q-init", default="4000")
     parser.add_argument("--aimd-q-min", default="1200")
     parser.add_argument("--aimd-q-max", default="16000")
@@ -95,15 +97,23 @@ def main() -> int:
         args.loogle_prefix_mix_mode,
         "--loogle-prefix-chunk-size",
         str(args.loogle_prefix_chunk_size),
+    ]
+
+    if args.loogle_prefix_strict_cold:
+        cmd.append("--loogle-prefix-strict-cold")
+
+    cmd.extend([
         "--aimd-jain-threshold",
         args.aimd_jain_threshold,
+        "--aimd-ttft-slo-ms",
+        args.aimd_ttft_slo_ms,
         "--aimd-q-init",
         args.aimd_q_init,
         "--aimd-q-min",
         args.aimd_q_min,
         "--aimd-q-max",
         args.aimd_q_max,
-    ]
+    ])
 
     if args.reuse_existing_url:
         cmd.extend(["--reuse-existing-url", args.reuse_existing_url])

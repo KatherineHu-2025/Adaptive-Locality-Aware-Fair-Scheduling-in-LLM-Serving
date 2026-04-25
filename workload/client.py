@@ -679,6 +679,8 @@ def _parse_args():
                    help="loogle_prefix only: request ordering strategy for dominant/cold mix")
     p.add_argument("--loogle-prefix-chunk-size", type=int, default=20,
                    help="loogle_prefix only: chunk size used when mix mode is 'chunked'")
+    p.add_argument("--loogle-prefix-strict-cold", action="store_true",
+                   help="loogle_prefix only: prepend a unique cold-only prefix so cache hits stay near zero")
     return p.parse_args()
 
 
@@ -709,6 +711,7 @@ async def _main():
             max_input_tokens=loogle_cap,
             mix_mode=args.loogle_prefix_mix_mode,
             chunk_size=args.loogle_prefix_chunk_size,
+            strict_cold=args.loogle_prefix_strict_cold,
             seed=args.seed,
         )
     elif args.dataset == "chatbot_arena":

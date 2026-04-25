@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,14 @@ def load_summary_csv(folder: Path):
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    if "output_file" in df.columns:
+        df["plot_label"] = df.apply(
+            lambda row: derive_plot_label(str(row.get("output_file", "")), str(row.get("policy", ""))),
+            axis=1,
+        )
+    else:
+        df["plot_label"] = df["policy"].astype(str)
+
     return df
 
 
@@ -113,6 +122,170 @@ def _as_bool(value: Any) -> bool:
     return False
 
 
+def derive_plot_label(output_file: str, policy: str) -> str:
+    """Return a display label that separates static DLPM runs by Q value."""
+    raw = str(output_file or "").strip()
+    base = Path(raw.replace("\\", "/")).stem
+    if "_r" in base:
+        return base.rsplit("_r", 1)[0]
+    return policy or base or "unknown"
+
+
+def label_sort_key(label: str) -> tuple[int, int, str]:
+    if label == "adaptive_dlpm":
+        return (0, 0, label)
+    if label == "lpm":
+        return (1, 0, label)
+    if label == "fcfs":
+        return (2, 0, label)
+    if label.startswith("dlpm_q"):
+        tail = label[len("dlpm_q"):]
+        try:
+            q_val = int(float(tail))
+        except ValueError:
+            q_val = 0
+        return (3, q_val, label)
+    return (4, 0, label)
+
+
+def subset_metrics_from_req_df(req_df, subset_name: str, mask_fn):
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise SystemExit(
+            "Missing dependency: pandas. Use your project venv, e.g. 'venv\\Scripts\\python.exe plot_benchmark_result.py ...'"
+        ) from exc
+
+    if req_df.empty:
+        return pd.DataFrame()
+
+    rows: list[dict[str, Any]] = []
+    for run_file, run_df in req_df.groupby("run_file", dropna=False):
+        run_all = run_df[run_df["success"] == True].copy()
+        if run_all.empty:
+            continue
+
+        subset = run_all[mask_fn(run_all)].copy()
+        if subset.empty:
+            continue
+
+        wall_time = float(run_all["arrival_time"].max()) if len(run_all) else float("nan")
+        if not math.isfinite(wall_time) or wall_time <= 0:
+            wall_time = float("nan")
+
+        ttfts = subset["ttft_ms"].dropna().tolist()
+        totals = subset["output_tokens"].fillna(0).astype(float).tolist()
+        rows.append(
+            {
+                "subset": subset_name,
+                "run_file": run_file,
+                "policy": str(subset["policy"].iloc[0]) if "policy" in subset.columns and not subset.empty else "",
+                "plot_label": str(subset["plot_label"].iloc[0]) if "plot_label" in subset.columns and not subset.empty else "",
+                "rate": float(subset["rate"].iloc[0]) if "rate" in subset.columns and not subset.empty else float("nan"),
+                "k": float(subset["k"].iloc[0]) if "k" in subset.columns and not subset.empty else float("nan"),
+                "request_count": int(subset["request_count"].iloc[0]) if "request_count" in subset.columns and not subset.empty else -1,
+                "count": int(len(subset)),
+                "throughput_tok_per_sec": float(sum(totals)) / wall_time if wall_time and math.isfinite(wall_time) else float("nan"),
+                "ttft_p50_ms": float(sorted(ttfts)[max(0, math.ceil(0.50 * len(ttfts)) - 1)]) if ttfts else float("nan"),
+                "ttft_p99_ms": float(sorted(ttfts)[max(0, math.ceil(0.99 * len(ttfts)) - 1)]) if ttfts else float("nan"),
+                "request_total_p50_ms": float(sorted(subset["request_total_ms"].dropna().tolist())[max(0, math.ceil(0.50 * len(subset["request_total_ms"].dropna().tolist())) - 1)]) if subset["request_total_ms"].notna().any() else float("nan"),
+                "request_total_p99_ms": float(sorted(subset["request_total_ms"].dropna().tolist())[max(0, math.ceil(0.99 * len(subset["request_total_ms"].dropna().tolist())) - 1)]) if subset["request_total_ms"].notna().any() else float("nan"),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame.from_records(rows)
+    if "plot_label" in out.columns:
+        out = out.sort_values("plot_label", key=lambda s: s.map(label_sort_key), kind="stable")
+    return out
+
+
+def format_subset_table(df) -> str:
+    if df is None or getattr(df, "empty", True):
+        return "(no data)"
+    cols = [c for c in ["plot_label", "throughput_tok_per_sec", "ttft_p50_ms", "ttft_p99_ms", "count"] if c in df.columns]
+    return df[cols].to_string(index=False)
+
+
+def plot_subset_breakdown(req_df, out_path: Path, dominant_prefix: str = "client_dominant", cold_prefix: str = "client_cold") -> bool:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if req_df.empty or "plot_label" not in req_df.columns:
+        return False
+
+    overall = subset_metrics_from_req_df(req_df, "overall", lambda d: d["success"] == True)
+    dominant = subset_metrics_from_req_df(
+        req_df,
+        "dominant",
+        lambda d: d["client_id"].astype(str).str.startswith(dominant_prefix),
+    )
+    cold = subset_metrics_from_req_df(
+        req_df,
+        "cold",
+        lambda d: d["client_id"].astype(str).str.startswith(cold_prefix),
+    )
+
+    subsets = [
+        ("Overall", overall),
+        ("Dominant", dominant),
+        ("Cold", cold),
+    ]
+    metrics = [
+        ("throughput_tok_per_sec", "Throughput (tokens/sec)"),
+        ("ttft_p50_ms", "TTFT P50 (ms)"),
+        ("ttft_p99_ms", "TTFT P99 (ms)"),
+    ]
+
+    fig, axes = plt.subplots(len(subsets), len(metrics), figsize=(18, 13), dpi=150)
+    if len(subsets) == 1:
+        axes = [axes]
+
+    all_labels = sorted(set(req_df["plot_label"].dropna().astype(str).tolist()), key=label_sort_key)
+    colors = {label: f"C{i % 10}" for i, label in enumerate(all_labels)}
+
+    any_data = False
+    for row_idx, (subset_name, subset_df) in enumerate(subsets):
+        for col_idx, (metric, ylabel) in enumerate(metrics):
+            ax = axes[row_idx][col_idx]
+            if subset_df.empty or metric not in subset_df.columns:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center")
+                ax.set_axis_off()
+                continue
+
+            plot_df = subset_df.sort_values("plot_label", key=lambda s: s.map(label_sort_key), kind="stable")
+            x_labels = plot_df["plot_label"].astype(str).tolist()
+            values = plot_df[metric].tolist()
+            if not values:
+                ax.text(0.5, 0.5, "No data", ha="center", va="center")
+                ax.set_axis_off()
+                continue
+
+            bar_colors = [colors.get(label, "C0") for label in x_labels]
+            ax.bar(x_labels, values, color=bar_colors, alpha=0.85)
+            ax.set_title(f"{subset_name} - {ylabel}")
+            ax.set_ylabel(ylabel)
+            ax.tick_params(axis="x", rotation=35)
+            ax.grid(True, axis="y", alpha=0.3)
+            if metric == "ttft_p99_ms":
+                ax.set_yscale("log")
+            any_data = True
+
+    if not any_data:
+        plt.close(fig)
+        return False
+
+    fig.suptitle("Overall vs Dominant vs Cold Breakdown by Plot Label")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
 def load_request_logs(df, folder: Path):
     try:
         import pandas as pd
@@ -140,6 +313,7 @@ def load_request_logs(df, folder: Path):
                     payload["run_file"] = str(run_path)
                     payload["run_name"] = run_path.name
                     payload["policy"] = row.get("policy", payload.get("policy", ""))
+                    payload["plot_label"] = derive_plot_label(str(run_path.name), str(row.get("policy", payload.get("policy", ""))))
                     payload["rate"] = row.get("rate")
                     payload["k"] = row.get("k")
                     payload["request_count"] = row.get("request_count")
@@ -199,7 +373,8 @@ def plot_metric_vs_rate(df, metric: str, ylabel: str, title: str, out_path: Path
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    policies = sorted(df["policy"].dropna().unique())
+    series_col = "plot_label" if "plot_label" in df.columns else "policy"
+    policies = sorted(df[series_col].dropna().astype(str).unique(), key=label_sort_key)
     ks = sorted(df["k"].dropna().unique())
     request_counts = sorted(df["request_count"].dropna().unique())
 
@@ -215,7 +390,7 @@ def plot_metric_vs_rate(df, metric: str, ylabel: str, title: str, out_path: Path
         d_req = df[df["request_count"] == req_count]
         for policy in policies:
             for kval in ks:
-                d = d_req[(d_req["policy"] == policy) & (d_req["k"] == kval)].sort_values("rate")
+                d = d_req[(d_req[series_col] == policy) & (d_req["k"] == kval)].sort_values("rate")
                 if d.empty:
                     continue
                 ax.plot(
@@ -253,7 +428,8 @@ def plot_pareto(df, out_path: Path) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    policies = sorted(df["policy"].dropna().unique())
+    series_col = "plot_label" if "plot_label" in df.columns else "policy"
+    policies = sorted(df[series_col].dropna().astype(str).unique(), key=label_sort_key)
     request_counts = sorted(df["request_count"].dropna().unique())
 
     color_map = {policy: f"C{i}" for i, policy in enumerate(policies)}
@@ -264,7 +440,7 @@ def plot_pareto(df, out_path: Path) -> None:
 
     for policy in policies:
         for n in request_counts:
-            d = df[(df["policy"] == policy) & (df["request_count"] == n)]
+            d = df[(df[series_col] == policy) & (df["request_count"] == n)]
             if d.empty:
                 continue
             label = f"{policy}, n={int(n)}"
@@ -321,7 +497,8 @@ def plot_ttft_percentile_histograms(df, out_path: Path) -> bool:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    policies = sorted(df["policy"].dropna().unique())
+    series_col = "plot_label" if "plot_label" in df.columns else "policy"
+    policies = sorted(df[series_col].dropna().astype(str).unique(), key=label_sort_key)
     if not policies:
         return False
 
@@ -330,8 +507,8 @@ def plot_ttft_percentile_histograms(df, out_path: Path) -> bool:
 
     has_data = False
     for policy in policies:
-        p50_vals = df.loc[df["policy"] == policy, "ttft_p50_ms"].dropna().tolist()
-        p99_vals = df.loc[df["policy"] == policy, "ttft_p99_ms"].dropna().tolist()
+        p50_vals = df.loc[df[series_col] == policy, "ttft_p50_ms"].dropna().tolist()
+        p99_vals = df.loc[df[series_col] == policy, "ttft_p99_ms"].dropna().tolist()
 
         if p50_vals:
             ax_p50.hist(p50_vals, bins=min(20, max(6, len(p50_vals))), alpha=0.45, color=colors[policy], label=policy)
@@ -382,12 +559,13 @@ def plot_ttft_request_histograms(req_df, out_path: Path) -> bool:
     if ok.empty:
         return False
 
-    policies = sorted(ok["policy"].dropna().unique())
+    series_col = "plot_label" if "plot_label" in ok.columns else "policy"
+    policies = sorted(ok[series_col].dropna().astype(str).unique(), key=label_sort_key)
     if not policies:
         return False
 
     policy_vals: dict[str, list[float]] = {
-        policy: ok.loc[ok["policy"] == policy, "ttft_ms"].dropna().tolist() for policy in policies
+        policy: ok.loc[ok[series_col] == policy, "ttft_ms"].dropna().tolist() for policy in policies
     }
     all_vals = [v for vals in policy_vals.values() for v in vals]
     if not all_vals:
@@ -397,10 +575,15 @@ def plot_ttft_request_histograms(req_df, out_path: Path) -> bool:
     global_max = float(max(all_vals))
     if global_max <= global_min:
         global_max = global_min + 1.0
+    global_min = max(global_min, 1e-3)
 
     bins_n = min(35, max(8, len(all_vals) // 20))
-    step = (global_max - global_min) / bins_n
-    bin_edges = [global_min + i * step for i in range(bins_n + 1)]
+    log_min = math.log10(global_min)
+    log_max = math.log10(global_max)
+    if log_max <= log_min:
+        log_max = log_min + 0.25
+    log_step = (log_max - log_min) / bins_n
+    bin_edges = [10 ** (log_min + i * log_step) for i in range(bins_n + 1)]
 
     n = len(policies)
     cols = 2
@@ -433,6 +616,7 @@ def plot_ttft_request_histograms(req_df, out_path: Path) -> bool:
         ax.set_xlabel("TTFT (ms)")
         ax.set_ylabel("Count")
         ax.grid(True, axis="y", alpha=0.3)
+        ax.set_xscale("log")
         ax.legend(loc="best")
 
     for j in range(len(policies), len(flat_axes)):
@@ -444,6 +628,18 @@ def plot_ttft_request_histograms(req_df, out_path: Path) -> bool:
         ax = flat_axes[i]
         ax.set_xlim(global_min, global_max)
         ax.set_ylim(0, max_bin_count * 1.10)
+        ticks = []
+        exp_min = int(math.floor(math.log10(global_min)))
+        exp_max = int(math.ceil(math.log10(global_max)))
+        for exp in range(exp_min, exp_max + 1):
+            for mult in (1, 2, 5):
+                tick = mult * (10 ** exp)
+                if global_min <= tick <= global_max:
+                    ticks.append(tick)
+        ticks = sorted(set(ticks))
+        if ticks:
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([f"{t:.0f}" if t >= 1000 else f"{t:.1f}" for t in ticks])
 
     fig.suptitle("Request-Level TTFT Histograms with P50/P99")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
@@ -482,12 +678,13 @@ def plot_request_total_histograms(req_df, out_path: Path) -> bool:
     if ok.empty:
         return False
 
-    policies = sorted(ok["policy"].dropna().unique())
+    series_col = "plot_label" if "plot_label" in ok.columns else "policy"
+    policies = sorted(ok[series_col].dropna().astype(str).unique(), key=label_sort_key)
     if not policies:
         return False
 
     policy_vals: dict[str, list[float]] = {
-        policy: ok.loc[ok["policy"] == policy, "request_total_ms"].dropna().tolist() for policy in policies
+        policy: ok.loc[ok[series_col] == policy, "request_total_ms"].dropna().tolist() for policy in policies
     }
     all_vals = [v for vals in policy_vals.values() for v in vals]
     if not all_vals:
@@ -497,10 +694,15 @@ def plot_request_total_histograms(req_df, out_path: Path) -> bool:
     global_max = float(max(all_vals))
     if global_max <= global_min:
         global_max = global_min + 1.0
+    global_min = max(global_min, 1e-3)
 
     bins_n = min(35, max(8, len(all_vals) // 20))
-    step = (global_max - global_min) / bins_n
-    bin_edges = [global_min + i * step for i in range(bins_n + 1)]
+    log_min = math.log10(global_min)
+    log_max = math.log10(global_max)
+    if log_max <= log_min:
+        log_max = log_min + 0.25
+    log_step = (log_max - log_min) / bins_n
+    bin_edges = [10 ** (log_min + i * log_step) for i in range(bins_n + 1)]
 
     n = len(policies)
     cols = 2
@@ -533,6 +735,7 @@ def plot_request_total_histograms(req_df, out_path: Path) -> bool:
         ax.set_xlabel("Request time (arrival to completion, ms)")
         ax.set_ylabel("Count")
         ax.grid(True, axis="y", alpha=0.3)
+        ax.set_xscale("log")
         ax.legend(loc="best")
 
     for j in range(len(policies), len(flat_axes)):
@@ -544,12 +747,47 @@ def plot_request_total_histograms(req_df, out_path: Path) -> bool:
         ax = flat_axes[i]
         ax.set_xlim(global_min, global_max)
         ax.set_ylim(0, max_bin_count * 1.10)
+        ticks = []
+        exp_min = int(math.floor(math.log10(global_min)))
+        exp_max = int(math.ceil(math.log10(global_max)))
+        for exp in range(exp_min, exp_max + 1):
+            for mult in (1, 2, 5):
+                tick = mult * (10 ** exp)
+                if global_min <= tick <= global_max:
+                    ticks.append(tick)
+        ticks = sorted(set(ticks))
+        if ticks:
+            ax.set_xticks(ticks)
+            ax.set_xticklabels([f"{t:.0f}" if t >= 1000 else f"{t:.1f}" for t in ticks])
 
     fig.suptitle("Request-Level End-to-End Latency Histograms with P50/P99")
     fig.tight_layout(rect=[0, 0, 1, 0.95])
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
     return True
+
+
+def _apply_front_focused_request_axis(ax, max_request_index: int) -> None:
+    """Use a log-scaled request axis so early requests get more horizontal space."""
+    if max_request_index <= 1:
+        ax.set_xlim(1, 1)
+        return
+
+    ax.set_xscale("log")
+    ax.set_xlim(1, max_request_index)
+
+    ticks: list[int] = []
+    current = 1
+    while current <= max_request_index:
+        for multiplier in (1, 2, 5):
+            tick = current * multiplier
+            if 1 <= tick <= max_request_index:
+                ticks.append(tick)
+        current *= 10
+
+    ticks = sorted(set(ticks))
+    ax.set_xticks(ticks)
+    ax.set_xticklabels([str(t) for t in ticks])
 
 
 def plot_aimd_overview(req_df, out_path: Path) -> bool:
@@ -583,6 +821,7 @@ def plot_aimd_overview(req_df, out_path: Path) -> bool:
 
     run_meta = run_meta.tail(6)
     q_has_points = False
+    q_max_request_index = 1
     for i, row in run_meta.iterrows():
         run_file = str(row["run_file"])
         d = adaptive[(adaptive["run_file"] == run_file) & (adaptive["Q_at_scheduling"] >= 0)].copy()
@@ -591,6 +830,8 @@ def plot_aimd_overview(req_df, out_path: Path) -> bool:
         d = d.sort_values(["arrival_time", "request_idx"], kind="stable")
         x = d["request_idx"].tolist()
         y = d["Q_at_scheduling"].tolist()
+        if x:
+            q_max_request_index = max(q_max_request_index, max(x))
         label = f"r={row['rate']:g}, k={row['k']:g}, n={int(row['request_count'])}"
         ax_q.plot(x, y, linewidth=1.8, alpha=0.9, label=label)
 
@@ -732,6 +973,7 @@ def plot_all_aimd_traces(req_df, out_dir: Path, prefix: str) -> list[Path]:
         q = d["Q_at_scheduling"].tolist() if "Q_at_scheduling" in d.columns else []
         jain = d["jain_control"].tolist() if "jain_control" in d.columns else []
         p99w = d["p99_ttft_window_ms"].tolist() if "p99_ttft_window_ms" in d.columns else []
+        max_x = max(x) if x else 1
 
         if q and any(not math.isnan(v) and v >= 0 for v in q):
             ax_q.plot(x, q, color="tab:blue", linewidth=1.8, label="Q_at_scheduling")
@@ -809,6 +1051,13 @@ def build_summary_markdown(df, folder: Path, req_df=None) -> str:
         ["policy", "rate", "k", "request_count", "throughput_tok_per_sec", "ttft_p50_ms", "ttft_p99_ms"]
     ]
 
+    best_thr_label = df.loc[df.groupby("plot_label")["throughput_tok_per_sec"].idxmax()][
+        ["plot_label", "policy", "rate", "k", "request_count", "throughput_tok_per_sec", "ttft_p99_ms"]
+    ]
+    best_p99_label = df.loc[df.groupby("plot_label")["ttft_p99_ms"].idxmin()][
+        ["plot_label", "policy", "rate", "k", "request_count", "throughput_tok_per_sec", "ttft_p50_ms", "ttft_p99_ms"]
+    ]
+
     high_load = (
         df[df["rate"] == df["rate"].max()]
         .groupby("policy")[["throughput_tok_per_sec", "ttft_p50_ms", "ttft_p99_ms"]]
@@ -817,8 +1066,15 @@ def build_summary_markdown(df, folder: Path, req_df=None) -> str:
     )
 
     outlier_rows = df[df["ttft_p99_ms"] > 10_000][
-        ["policy", "rate", "k", "request_count", "ttft_p99_ms", "output_file"]
+        ["plot_label", "policy", "rate", "k", "request_count", "ttft_p99_ms", "output_file"]
     ]
+
+    plot_label_medians = (
+        df.groupby("plot_label")[["throughput_tok_per_sec", "ttft_p50_ms", "ttft_p99_ms"]]
+        .median()
+        .sort_values("ttft_p99_ms")
+        .round(3)
+    )
 
     lines: list[str] = []
     lines.append(f"# Benchmark Summary: {folder.name}")
@@ -851,11 +1107,74 @@ def build_summary_markdown(df, folder: Path, req_df=None) -> str:
     lines.append("```")
     lines.append("")
 
+    lines.append("## Best Throughput Row Per Plot Label")
+    lines.append("```text")
+    lines.append(best_thr_label.to_string(index=False))
+    lines.append("```")
+    lines.append("")
+
+    lines.append("## Best (Lowest) TTFT P99 Row Per Plot Label")
+    lines.append("```text")
+    lines.append(best_p99_label.to_string(index=False))
+    lines.append("```")
+    lines.append("")
+
     lines.append("## High-Load (Max Rate) Median by Policy")
     lines.append("```text")
     lines.append(high_load.to_string())
     lines.append("```")
     lines.append("")
+
+    lines.append("## Median Metrics by Plot Label")
+    lines.append("```text")
+    lines.append(plot_label_medians.to_string())
+    lines.append("```")
+    lines.append("")
+
+    if req_df is not None and not getattr(req_df, "empty", True):
+        overall = subset_metrics_from_req_df(req_df, "overall", lambda d: d["success"] == True)
+        dominant = subset_metrics_from_req_df(
+            req_df,
+            "dominant",
+            lambda d: d["client_id"].astype(str).str.startswith("client_dominant"),
+        )
+        cold = subset_metrics_from_req_df(
+            req_df,
+            "cold",
+            lambda d: d["client_id"].astype(str).str.startswith("client_cold"),
+        )
+
+        lines.append("## Overall / Dominant / Cold Breakdown")
+        lines.append("")
+        lines.append("### Overall")
+        lines.append("```text")
+        lines.append(format_subset_table(overall))
+        lines.append("```")
+        lines.append("")
+        lines.append("### Dominant")
+        lines.append("```text")
+        lines.append(format_subset_table(dominant))
+        lines.append("```")
+        lines.append("")
+        lines.append("### Cold")
+        lines.append("```text")
+        lines.append(format_subset_table(cold))
+        lines.append("```")
+        lines.append("")
+
+        if not overall.empty and "plot_label" in overall.columns:
+            best_overall = overall.sort_values(["ttft_p99_ms", "ttft_p50_ms", "throughput_tok_per_sec"], ascending=[True, True, False]).iloc[0]
+            best_dom = dominant.sort_values(["ttft_p99_ms", "ttft_p50_ms", "throughput_tok_per_sec"], ascending=[True, True, False]).iloc[0] if not dominant.empty else None
+            worst_cold = cold.sort_values(["ttft_p99_ms", "ttft_p50_ms", "throughput_tok_per_sec"], ascending=[False, False, True]).iloc[0] if not cold.empty else None
+            lines.append("### Quick Read")
+            lines.append("```text")
+            lines.append(f"best_overall_by_ttft_p99: {best_overall['plot_label']} (ttft_p99={best_overall['ttft_p99_ms']:.3f} ms)")
+            if best_dom is not None:
+                lines.append(f"best_dominant_by_ttft_p99: {best_dom['plot_label']} (ttft_p99={best_dom['ttft_p99_ms']:.3f} ms)")
+            if worst_cold is not None:
+                lines.append(f"worst_cold_by_ttft_p99: {worst_cold['plot_label']} (ttft_p99={worst_cold['ttft_p99_ms']:.3f} ms)")
+            lines.append("```")
+            lines.append("")
 
     if len(outlier_rows) > 0:
         lines.append("## Severe TTFT P99 Outliers (> 10,000 ms)")
@@ -956,6 +1275,9 @@ def main() -> int:
     summary = build_summary_markdown(df, folder, req_df=req_df)
     summary_md.write_text(summary, encoding="utf-8")
 
+    breakdown_plot = out_dir / f"{prefix}_subset_breakdown.png"
+    made_breakdown = plot_subset_breakdown(req_df=req_df, out_path=breakdown_plot)
+
     print("=== Benchmark Plotting Complete ===")
     print("input folder:", folder)
     print("throughput plot:", throughput_plot)
@@ -964,6 +1286,7 @@ def main() -> int:
     print("ttft percentile histogram:", ttft_percentile_hist_plot if made_ttft_percentile_hist else "(skipped: no data)")
     print("ttft request histogram:", ttft_request_hist_plot if made_ttft_request_hist else "(skipped: no request TTFT data)")
     print("request total histogram:", request_total_hist_plot if made_request_total_hist else "(skipped: no request end-to-end data)")
+    print("subset breakdown:", breakdown_plot if made_breakdown else "(skipped: no subset data)")
     print("aimd overview:", aimd_overview_plot if made_aimd_overview else "(skipped: no AIMD metadata)")
     print("aimd violation reasons:", aimd_reasons_plot if made_aimd_reasons else "(skipped: no violation reason data)")
     if aimd_trace_paths:

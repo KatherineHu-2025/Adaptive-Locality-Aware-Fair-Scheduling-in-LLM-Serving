@@ -403,6 +403,7 @@ def load_loogle_prefix_mix(
     max_input_tokens: Optional[int] = 26000,
     mix_mode: str = "interleave",
     chunk_size: int = 20,
+    strict_cold: bool = False,
     seed: int = 42,
     token_len_fn: Callable[[str], int] = _word_count_estimator,
 ) -> List[RequestSpec]:
@@ -456,9 +457,9 @@ def load_loogle_prefix_mix(
         return []
     rng.shuffle(dominant_qas)
 
-    def _build_prompt(context: str, question: str) -> tuple[str, bool]:
+    def _build_prompt(context: str, question: str, lead_text: str = "") -> tuple[str, bool]:
         question_suffix = f"\n\nQuestion: {question}"
-        prompt = f"{context}{question_suffix}"
+        prompt = f"{lead_text}{context}{question_suffix}"
         if max_input_tokens is None or token_len_fn(prompt) <= max_input_tokens:
             return prompt, False
 
@@ -469,13 +470,13 @@ def load_loogle_prefix_mix(
         while lo <= hi:
             mid = (lo + hi) // 2
             candidate_context = " ".join(context_words[:mid])
-            candidate_prompt = f"{candidate_context}{question_suffix}"
+            candidate_prompt = f"{lead_text}{candidate_context}{question_suffix}"
             if token_len_fn(candidate_prompt) <= max_input_tokens:
                 best = mid
                 lo = mid + 1
             else:
                 hi = mid - 1
-        truncated_prompt = f"{' '.join(context_words[:best])}{question_suffix}"
+        truncated_prompt = f"{lead_text}{' '.join(context_words[:best])}{question_suffix}"
         return truncated_prompt, True
 
     dominant_specs: list[RequestSpec] = []
@@ -514,7 +515,8 @@ def load_loogle_prefix_mix(
         context = str(ex["context"])
         question = str(ex["question"])
         answer = str(ex["answer"])
-        prompt, truncated = _build_prompt(context, question)
+        cold_lead = f"STRICT_COLD_CLIENT={cold_client_prefix}_{i:04d}::" if strict_cold else ""
+        prompt, truncated = _build_prompt(context, question, lead_text=cold_lead)
         if truncated:
             truncated_count += 1
         cold_specs.append(
